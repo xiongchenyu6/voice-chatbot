@@ -475,17 +475,45 @@ const HTML_CONTENT = `
                     // Process audio directly without turn detection
                     const maxSamples = Math.min(16000, this.audioBuffer.length);
                     const audioData = new Float32Array(this.audioBuffer.slice(0, maxSamples));
-                    const audioBytes = new Uint8Array(audioData.buffer);
                     
-                    // Use safe base64 encoding
-                    let base64Audio = '';
-                    const chunkSize = 8192;
-                    for (let i = 0; i < audioBytes.length; i += chunkSize) {
-                        const chunk = audioBytes.slice(i, i + chunkSize);
-                        base64Audio += btoa(String.fromCharCode.apply(null, Array.from(chunk)));
+                    console.log('Audio data sample:', audioData.slice(0, 10));
+                    
+                    // Convert Float32 PCM to 16-bit PCM for better compatibility
+                    const pcm16 = new Int16Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        // Clamp and convert to 16-bit signed integer
+                        pcm16[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32767));
                     }
                     
-                    // Send directly for ASR processing instead of turn detection
+                    // Convert to bytes properly
+                    const audioBytes = new Uint8Array(pcm16.buffer);
+                    
+                    console.log('Audio bytes length:', audioBytes.length);
+                    console.log('First 16 bytes:', Array.from(audioBytes.slice(0, 16)));
+                    
+                    // Create base64 using safe chunked approach
+                    let base64Audio = '';
+                    const chunkSize = 1024; // Smaller chunks for safety
+                    
+                    for (let i = 0; i < audioBytes.length; i += chunkSize) {
+                        const chunk = audioBytes.slice(i, i + chunkSize);
+                        const chunkArray = Array.from(chunk);
+                        const chunkString = String.fromCharCode.apply(null, chunkArray);
+                        base64Audio += btoa(chunkString);
+                    }
+                    
+                    console.log('Base64 audio length:', base64Audio.length);
+                    console.log('Base64 sample (first 100 chars):', base64Audio.substring(0, 100));
+                    
+                    // Validate base64 before sending
+                    try {
+                        atob(base64Audio); // Test decode
+                        console.log('Base64 validation passed');
+                    } catch (validateError) {
+                        throw new Error('Generated invalid base64: ' + validateError.message);
+                    }
+                    
+                    // Send for ASR processing
                     this.sendAudioForProcessing(base64Audio);
                     this.addMessage('system', 'Audio sent for processing...');
                     
@@ -493,6 +521,7 @@ const HTML_CONTENT = `
                     this.audioBuffer = this.audioBuffer.slice(maxSamples);
                     
                 } catch (error) {
+                    console.error('Processing error:', error);
                     this.addMessage('error', 'Test processing failed: ' + error.message);
                 }
             }
@@ -741,17 +770,28 @@ const HTML_CONTENT = `
                 console.log('Turn detection processing started');
                 
                 try {
-                    // Convert Float32Array to base64 for API (limit to 16K samples to prevent stack overflow)
+                    // Process audio with proper PCM conversion
                     const maxSamples = Math.min(16000, this.audioBuffer.length);
                     const audioData = new Float32Array(this.audioBuffer.slice(0, maxSamples));
-                    const audioBytes = new Uint8Array(audioData.buffer);
                     
-                    // Use safe base64 encoding to prevent stack overflow
+                    // Convert Float32 PCM to 16-bit PCM
+                    const pcm16 = new Int16Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        pcm16[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32767));
+                    }
+                    
+                    // Convert to bytes properly
+                    const audioBytes = new Uint8Array(pcm16.buffer);
+                    
+                    // Create base64 using safe chunked approach
                     let base64Audio = '';
-                    const chunkSize = 8192; // Process in smaller chunks
+                    const chunkSize = 1024;
+                    
                     for (let i = 0; i < audioBytes.length; i += chunkSize) {
                         const chunk = audioBytes.slice(i, i + chunkSize);
-                        base64Audio += btoa(String.fromCharCode.apply(null, Array.from(chunk)));
+                        const chunkArray = Array.from(chunk);
+                        const chunkString = String.fromCharCode.apply(null, chunkArray);
+                        base64Audio += btoa(chunkString);
                     }
                     
                     console.log('Sending turn detection request with', maxSamples, 'samples...');
