@@ -407,7 +407,7 @@ const HTML_CONTENT = `
                 this.audioBuffer = [];
                 this.turnDetectionThreshold = 0.7; // Probability threshold for turn completion
                 this.lastTurnDetectionTime = 0; // Throttling for turn detection
-                this.turnDetectionInterval = 2000; // Minimum 2 seconds between turn detections
+                this.turnDetectionInterval = 5000; // Minimum 5 seconds between turn detections (increased)
                 this.pendingTurnDetection = false; // Flag to prevent multiple pending detections
                 
                 this.initializeElements();
@@ -525,17 +525,17 @@ const HTML_CONTENT = `
                             typeof AudioWorkletNode !== 'undefined') {
                             
                             // Load audio worklet processor
-                            const workletBlob = this.createAudioWorkletBlob();
-                            if (workletBlob) {
-                                await this.audioContext.audioWorklet.addModule(workletBlob);
+                            const workletInfo = this.createAudioWorkletBlob();
+                            if (workletInfo && workletInfo.url) {
+                                await this.audioContext.audioWorklet.addModule(workletInfo.url);
                                 
-                                this.processorNode = new AudioWorkletNode(this.audioContext, 'audio-processor');
+                                this.processorNode = new AudioWorkletNode(this.audioContext, workletInfo.processorName);
                                 this.processorNode.port.onmessage = (event) => {
                                     if (this.isListening && !this.isProcessingTurn) {
                                         this.processAudioData(event.data.audioData);
                                     }
                                 };
-                                console.log('Using modern AudioWorkletNode');
+                                console.log('Using modern AudioWorkletNode with processor:', workletInfo.processorName);
                             } else {
                                 throw new Error('Failed to create AudioWorklet blob');
                             }
@@ -576,6 +576,9 @@ const HTML_CONTENT = `
                 // Only create AudioWorklet in browser context
                 if (typeof window === 'undefined') return null;
                 
+                // Generate unique processor name to avoid registration conflicts
+                const processorName = 'audio-processor-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+                
                 const audioWorkletCode = 
                     'class AudioProcessor extends AudioWorkletProcessor {' +
                     '    constructor() {' +
@@ -606,20 +609,17 @@ const HTML_CONTENT = `
                     '    }' +
                     '}' +
                     '' +
-                    'registerProcessor("audio-processor", AudioProcessor);';
+                    'registerProcessor("' + processorName + '", AudioProcessor);';
                 
                 const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
-                return URL.createObjectURL(blob);
+                return { url: URL.createObjectURL(blob), processorName: processorName };
             }
 
             processAudioData(audioData) {
                 // Store audio data for later processing
                 this.audioBuffer.push(...audioData);
                 
-                // TEMPORARY: Disable turn detection to test audio processing stability
-                // TODO: Re-enable once we confirm audio processing is stable
-                /*
-                // Implement proper debouncing with more strict conditions
+                // Re-enable turn detection with proper throttling
                 const now = Date.now();
                 const hasEnoughData = this.audioBuffer.length >= 32000;
                 const isNotBusy = !this.isProcessingTurn && !this.pendingTurnDetection;
@@ -635,11 +635,10 @@ const HTML_CONTENT = `
                     // Use a longer delay and ensure proper async handling
                     setTimeout(() => {
                         this.performTurnDetection();
-                    }, 100);
+                    }, 200); // Increased delay to prevent rapid firing
                 }
-                */
                 
-                // Just log audio processing to verify it's working
+                // Just log audio processing periodically
                 if (this.audioBuffer.length % 16000 === 0) {
                     console.log('Audio buffer size:', this.audioBuffer.length);
                 }
