@@ -405,6 +405,9 @@ const HTML_CONTENT = `
                 this.silenceTimeout = null;
                 this.audioBuffer = [];
                 this.turnDetectionThreshold = 0.7; // Probability threshold for turn completion
+                this.lastTurnDetectionTime = 0; // Throttling for turn detection
+                this.turnDetectionInterval = 2000; // Minimum 2 seconds between turn detections
+                this.pendingTurnDetection = false; // Flag to prevent multiple pending detections
                 
                 this.initializeElements();
                 this.initializeWebSocket();
@@ -536,7 +539,10 @@ const HTML_CONTENT = `
                     this.processorNode.connect(this.audioContext.destination);
                     
                     this.isListening = true;
+                    this.isProcessingTurn = false;
+                    this.pendingTurnDetection = false;
                     this.audioBuffer = [];
+                    this.lastTurnDetectionTime = 0;
                     this.updateListeningStatus('🎧 Listening...', 'listening');
                     this.toggleBtn.textContent = '🛑 Stop Listening';
                     this.toggleBtn.classList.add('recording');
@@ -593,10 +599,22 @@ const HTML_CONTENT = `
                 // Store audio data for later processing
                 this.audioBuffer.push(...audioData);
                 
-                // Send audio chunk for turn detection every 32K samples
-                // Use setTimeout to prevent recursive stack overflow
-                if (this.audioBuffer.length >= 32000 && !this.isProcessingTurn) {
-                    setTimeout(() => this.checkTurnCompletion(), 0);
+                // Throttle turn detection - only check every 2 seconds and if not already processing
+                const now = Date.now();
+                if (this.audioBuffer.length >= 32000 && 
+                    !this.isProcessingTurn && 
+                    !this.pendingTurnDetection &&
+                    (now - this.lastTurnDetectionTime) >= this.turnDetectionInterval) {
+                    
+                    this.pendingTurnDetection = true;
+                    this.lastTurnDetectionTime = now;
+                    
+                    // Use setTimeout to avoid blocking the audio thread
+                    setTimeout(() => {
+                        this.checkTurnCompletion().finally(() => {
+                            this.pendingTurnDetection = false;
+                        });
+                    }, 50); // Small delay to avoid blocking
                 }
             }
 
@@ -611,7 +629,10 @@ const HTML_CONTENT = `
                 }
                 
                 this.isListening = false;
+                this.isProcessingTurn = false;
+                this.pendingTurnDetection = false;
                 this.audioBuffer = [];
+                this.lastTurnDetectionTime = 0;
                 this.updateListeningStatus('Ready to listen', '');
                 this.toggleBtn.textContent = '🎤 Start Listening';
                 this.toggleBtn.classList.remove('recording');
@@ -622,18 +643,12 @@ const HTML_CONTENT = `
             }
 
             processAudioChunk(inputBuffer) {
-                // Convert audio buffer to PCM data for turn detection
+                // Convert audio buffer to PCM data for turn detection (ScriptProcessorNode fallback)
                 const channelData = inputBuffer.getChannelData(0);
                 const pcmData = new Float32Array(channelData);
                 
-                // Store audio data for later processing
-                this.audioBuffer.push(...pcmData);
-                
-                // Send audio chunk for turn detection every 2 seconds or 32K samples
-                // Use setTimeout to prevent recursive stack overflow
-                if (this.audioBuffer.length >= 32000 && !this.isProcessingTurn) {
-                    setTimeout(() => this.checkTurnCompletion(), 0);
-                }
+                // Use the same logic as processAudioData
+                this.processAudioData(pcmData);
             }
 
             async checkTurnCompletion() {
