@@ -378,7 +378,7 @@ const HTML_CONTENT = `
         
         <div class="controls">
             <button id="toggleBtn" class="record-btn">🎤 Start Listening</button>
-            <button id="testBtn" class="record-btn" style="background-color: #6c757d;">🧪 Test Process</button>
+            <button id="testBtn" class="record-btn" style="background-color: #6c757d;">🎯 Process Audio</button>
             <div class="status-indicator">
                 <span id="listeningStatus">Ready to listen</span>
             </div>
@@ -436,7 +436,7 @@ const HTML_CONTENT = `
                 
                 this.ws.onopen = () => {
                     this.updateConnectionStatus('connected', 'Connected');
-                    this.addMessage('system', 'Connected! Click "Start Listening" for real-time voice chat.');
+                    this.addMessage('system', 'Connected! Click "Start Listening" then "Process Audio" to chat.');
                 };
                 
                 this.ws.onmessage = (event) => {
@@ -469,11 +469,29 @@ const HTML_CONTENT = `
                     return;
                 }
                 
-                this.addMessage('system', 'Testing with ' + this.audioBuffer.length + ' audio samples...');
+                this.addMessage('system', 'Processing ' + this.audioBuffer.length + ' audio samples directly...');
                 
                 try {
-                    await this.performTurnDetection();
-                    this.addMessage('system', 'Test processing completed.');
+                    // Process audio directly without turn detection
+                    const maxSamples = Math.min(16000, this.audioBuffer.length);
+                    const audioData = new Float32Array(this.audioBuffer.slice(0, maxSamples));
+                    const audioBytes = new Uint8Array(audioData.buffer);
+                    
+                    // Use safe base64 encoding
+                    let base64Audio = '';
+                    const chunkSize = 8192;
+                    for (let i = 0; i < audioBytes.length; i += chunkSize) {
+                        const chunk = audioBytes.slice(i, i + chunkSize);
+                        base64Audio += btoa(String.fromCharCode.apply(null, Array.from(chunk)));
+                    }
+                    
+                    // Send directly for ASR processing instead of turn detection
+                    this.sendAudioForProcessing(base64Audio);
+                    this.addMessage('system', 'Audio sent for processing...');
+                    
+                    // Clear processed samples
+                    this.audioBuffer = this.audioBuffer.slice(maxSamples);
+                    
                 } catch (error) {
                     this.addMessage('error', 'Test processing failed: ' + error.message);
                 }
@@ -619,6 +637,9 @@ const HTML_CONTENT = `
                 // Store audio data for later processing
                 this.audioBuffer.push(...audioData);
                 
+                // TEMPORARILY DISABLE automatic turn detection to prevent stack overflow
+                // Keep manual testing available via the Test button
+                /*
                 // Re-enable turn detection with proper throttling
                 const now = Date.now();
                 const hasEnoughData = this.audioBuffer.length >= 32000;
@@ -637,10 +658,11 @@ const HTML_CONTENT = `
                         this.performTurnDetection();
                     }, 200); // Increased delay to prevent rapid firing
                 }
+                */
                 
                 // Just log audio processing periodically
                 if (this.audioBuffer.length % 16000 === 0) {
-                    console.log('Audio buffer size:', this.audioBuffer.length);
+                    console.log('Audio buffer size:', this.audioBuffer.length, '- Use Test button to manually process');
                 }
                 
                 // Limit buffer size to prevent memory issues
@@ -719,12 +741,20 @@ const HTML_CONTENT = `
                 console.log('Turn detection processing started');
                 
                 try {
-                    // Convert Float32Array to base64 for API (limit to 32K samples)
-                    const audioData = new Float32Array(this.audioBuffer.slice(0, 32000));
+                    // Convert Float32Array to base64 for API (limit to 16K samples to prevent stack overflow)
+                    const maxSamples = Math.min(16000, this.audioBuffer.length);
+                    const audioData = new Float32Array(this.audioBuffer.slice(0, maxSamples));
                     const audioBytes = new Uint8Array(audioData.buffer);
-                    const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
                     
-                    console.log('Sending turn detection request...');
+                    // Use safe base64 encoding to prevent stack overflow
+                    let base64Audio = '';
+                    const chunkSize = 8192; // Process in smaller chunks
+                    for (let i = 0; i < audioBytes.length; i += chunkSize) {
+                        const chunk = audioBytes.slice(i, i + chunkSize);
+                        base64Audio += btoa(String.fromCharCode.apply(null, Array.from(chunk)));
+                    }
+                    
+                    console.log('Sending turn detection request with', maxSamples, 'samples...');
                     
                     // Send to turn detection API with timeout
                     const turnDetectionResult = await Promise.race([
