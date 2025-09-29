@@ -44,28 +44,64 @@ export class WebSocketHibernationServer {
 
   async webSocketMessage(ws, message) {
     try {
-      // Expect raw audio data or JSON with audio
-      let audioBuffer;
-      
+      // Handle different message types
       if (typeof message === 'string') {
-        // JSON message with base64 audio
+        // JSON message with different types
         const data = JSON.parse(message);
-        if (data.type === 'audio' && data.audio) {
-          audioBuffer = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
+        
+        if (data.type === 'turn_detection') {
+          await this.handleTurnDetection(ws, data);
+          return;
+        } else if (data.type === 'audio_processing') {
+          // Process complete audio for ASR
+          const audioBuffer = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
+          await this.handleAudioInput(ws, audioBuffer);
+          return;
+        } else if (data.type === 'audio' && data.audio) {
+          // Legacy audio handling
+          const audioBuffer = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
+          await this.handleAudioInput(ws, audioBuffer);
+          return;
         } else {
-          ws.send(JSON.stringify({ type: 'error', message: 'Expected audio data' }));
+          ws.send(JSON.stringify({ type: 'error', message: 'Expected audio data or turn detection' }));
           return;
         }
       } else {
-        // Direct binary audio data
-        audioBuffer = new Uint8Array(message);
+        // Direct binary audio data (legacy)
+        const audioBuffer = new Uint8Array(message);
+        await this.handleAudioInput(ws, audioBuffer);
       }
-      
-      await this.handleAudioInput(ws, audioBuffer);
       
     } catch (error) {
       console.error('WebSocket message error:', error);
       ws.send(JSON.stringify({ type: 'error', message: error.message }));
+    }
+  }
+
+  async handleTurnDetection(ws, data) {
+    try {
+      console.log('Processing turn detection request');
+      
+      // Use the smart turn detection model
+      const turnResult = await this.env.AI.run('@cf/pipecat-ai/smart-turn-v2', {
+        audio: data.audio,
+        dtype: data.dtype || 'float32'
+      });
+
+      console.log('Turn detection result:', turnResult);
+      
+      // Send result back to client
+      ws.send(JSON.stringify({
+        type: 'turn_detection_result',
+        result: turnResult
+      }));
+
+    } catch (error) {
+      console.error('Turn detection error:', error);
+      ws.send(JSON.stringify({ 
+        type: 'turn_detection_result', 
+        result: { is_complete: false, probability: 0 }
+      }));
     }
   }
 
@@ -97,38 +133,78 @@ export class WebSocketHibernationServer {
 
   async processAndRespondWithAudio(ws, inputText) {
     try {
-      // LLM: Generate response using GPT
-      const chatResponse = await this.env.AI.run('@cf/openai/gpt-oss-120b', {
-        messages: [
-          { role: 'system', content: 'You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech.' },
-          { role: 'user', content: inputText }
-        ],
-        max_tokens: 256
-      });
+      // LLM: Generate response using GPT OSS 120B
+      let chatResponse;
+      try {
+        console.log('Generating response with GPT OSS 120B');
+        chatResponse = await this.env.AI.run('@cf/openai/gpt-oss-120b', {
+          instructions: 'You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech. Respond in a friendly, engaging manner suitable for voice interaction.',
+          input: inputText
+        });
+      } catch (llmError) {
+        console.log('GPT OSS 120B failed, trying Llama fallback:', llmError.message);
+        // Fallback to Llama if GPT OSS fails
+        try {
+          chatResponse = await this.env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+            messages: [
+              { role: 'system', content: 'You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech.' },
+              { role: 'user', content: inputText }
+            ]
+          });
+        } catch (fallbackError) {
+          console.log('Llama fallback also failed:', fallbackError.message);
+          chatResponse = { response: 'I apologize, but I could not generate a response at this time.' };
+        }
+      }
 
-      const responseText = chatResponse.response || 'I apologize, but I could not generate a response.';
+      const responseText = chatResponse.response || chatResponse.output || 'I apologize, but I could not generate a response.';
+      console.log('LLM Response:', responseText);
 
-      // TTS: Convert response to speech
-      const ttsResult = await this.env.AI.run('@cf/deepgram/aura-1', {
-        text: responseText
-      });
+      // TTS: Use Deepgram Aura with returnRawResponse option
+      let ttsResult = null;
+      try {
+        console.log('Using TTS model: @cf/deepgram/aura-1');
+        ttsResult = await this.env.AI.run("@cf/deepgram/aura-1", {
+          text: responseText
+        }, {
+          returnRawResponse: true
+        });
+        console.log('TTS success with @cf/deepgram/aura-1');
+      } catch (ttsError) {
+        console.log('TTS failed with @cf/deepgram/aura-1:', ttsError.message);
+        ws.send(JSON.stringify({ type: 'error', message: 'TTS failed: ' + ttsError.message }));
+        return;
+      }
 
-      // Send audio response directly
-      if (ttsResult instanceof ArrayBuffer) {
+      // Send the raw response directly
+      console.log('TTS result type:', typeof ttsResult, 'instanceof Response:', ttsResult instanceof Response);
+      
+      if (ttsResult instanceof Response) {
+        // If it's a Response object, get the arrayBuffer
+        console.log('Getting arrayBuffer from Response object');
+        const audioBuffer = await ttsResult.arrayBuffer();
+        console.log('Audio buffer size:', audioBuffer.byteLength);
+        ws.send(audioBuffer);
+      } else if (ttsResult instanceof ArrayBuffer) {
+        // Direct ArrayBuffer
+        console.log('Sending direct ArrayBuffer, size:', ttsResult.byteLength);
         ws.send(ttsResult);
       } else {
-        // Fallback: send as base64 JSON
-        const audioArray = new Uint8Array(ttsResult);
-        const audioBase64 = btoa(String.fromCharCode(...audioArray));
-        ws.send(JSON.stringify({ 
-          type: 'audio', 
-          audio: audioBase64
-        }));
+        // Try to handle other formats
+        console.log('Unknown TTS result format, attempting conversion');
+        try {
+          const audioArray = new Uint8Array(ttsResult);
+          ws.send(audioArray.buffer);
+        } catch (conversionError) {
+          console.error('Failed to convert TTS result:', conversionError);
+          ws.send(JSON.stringify({ type: 'error', message: 'TTS response format not supported: ' + conversionError.message }));
+          return;
+        }
       }
 
     } catch (error) {
       console.error('Response generation error:', error);
-      ws.send(JSON.stringify({ type: 'error', message: 'Failed to generate response' }));
+      ws.send(JSON.stringify({ type: 'error', message: 'Failed to generate response: ' + error.message }));
     }
   }
 
@@ -244,6 +320,24 @@ const HTML_CONTENT = `
         .send-btn:hover {
             background-color: #0056b3;
         }
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+            border: 1px solid #dee2e6;
+        }
+        .listening {
+            background-color: #d1ecf1 !important;
+            color: #0c5460 !important;
+            animation: pulse 2s infinite;
+        }
+        .processing {
+            background-color: #fff3cd !important;
+            color: #856404 !important;
+        }
         .volume-control {
             display: flex;
             align-items: center;
@@ -275,15 +369,18 @@ const HTML_CONTENT = `
 </head>
 <body>
     <div class="container">
-        <h1>🎤 Voice Chatbot</h1>
-        <p>Powered by Cloudflare AI Workers - Speak or type to chat!</p>
+        <h1>🎤 Real-Time Voice Chatbot</h1>
+        <p>Powered by Cloudflare AI Workers with Smart Turn Detection - Just start listening and speak naturally!</p>
         
         <div id="connectionStatus" class="connection-status connecting">Connecting...</div>
         
         <div id="chatArea" class="chat-area"></div>
         
         <div class="controls">
-            <button id="recordBtn" class="record-btn">🎤 Start Recording</button>
+            <button id="toggleBtn" class="record-btn">🎤 Start Listening</button>
+            <div class="status-indicator">
+                <span id="listeningStatus">Ready to listen</span>
+            </div>
         </div>
         
         <div class="volume-control">
@@ -298,10 +395,16 @@ const HTML_CONTENT = `
             constructor() {
                 this.ws = null;
                 this.mediaRecorder = null;
+                this.audioStream = null;
                 this.audioChunks = [];
-                this.isRecording = false;
+                this.isListening = false;
                 this.audioContext = null;
                 this.volume = 0.8;
+                this.processorNode = null;
+                this.isProcessingTurn = false;
+                this.silenceTimeout = null;
+                this.audioBuffer = [];
+                this.turnDetectionThreshold = 0.7; // Probability threshold for turn completion
                 
                 this.initializeElements();
                 this.initializeWebSocket();
@@ -310,7 +413,8 @@ const HTML_CONTENT = `
 
             initializeElements() {
                 this.chatArea = document.getElementById('chatArea');
-                this.recordBtn = document.getElementById('recordBtn');
+                this.toggleBtn = document.getElementById('toggleBtn');
+                this.listeningStatus = document.getElementById('listeningStatus');
                 this.volumeSlider = document.getElementById('volumeSlider');
                 this.volumeValue = document.getElementById('volumeValue');
                 this.connectionStatus = document.getElementById('connectionStatus');
@@ -322,17 +426,16 @@ const HTML_CONTENT = `
                 
                 this.ws = new WebSocket(wsUrl);
                 
+                // Set binary type to handle audio data properly
+                this.ws.binaryType = 'arraybuffer';
+                
                 this.ws.onopen = () => {
                     this.updateConnectionStatus('connected', 'Connected');
-                    this.addMessage('system', 'Connected! Press and hold the microphone to speak.');
+                    this.addMessage('system', 'Connected! Click "Start Listening" for real-time voice chat.');
                 };
                 
                 this.ws.onmessage = (event) => {
-                    if (event.data instanceof ArrayBuffer) {
-                        this.handleWebSocketMessage(event.data);
-                    } else {
-                        this.handleWebSocketMessage(event.data);
-                    }
+                    this.handleWebSocketMessage(event.data);
                 };
                 
                 this.ws.onclose = () => {
@@ -347,7 +450,7 @@ const HTML_CONTENT = `
             }
 
             initializeEventListeners() {
-                this.recordBtn.addEventListener('click', () => this.toggleRecording());
+                this.toggleBtn.addEventListener('click', () => this.toggleListening());
                 this.volumeSlider.addEventListener('input', (e) => {
                     this.volume = parseFloat(e.target.value);
                     this.volumeValue.textContent = Math.round(this.volume * 100) + '%';
@@ -359,124 +462,280 @@ const HTML_CONTENT = `
                 this.connectionStatus.textContent = text;
             }
 
-            async toggleRecording() {
-                if (this.isRecording) {
-                    this.stopRecording();
+            async toggleListening() {
+                if (this.isListening) {
+                    this.stopListening();
                 } else {
-                    await this.startRecording();
+                    await this.startListening();
                 }
             }
 
-            async startRecording() {
+            async startListening() {
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    // Initialize AudioContext on user interaction
+                    if (!this.audioContext) {
+                        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        console.log('Created AudioContext for real-time processing');
+                    }
                     
-                    this.mediaRecorder = new MediaRecorder(stream, {
-                        mimeType: 'audio/webm;codecs=opus'
+                    if (this.audioContext.state === 'suspended') {
+                        await this.audioContext.resume();
+                        console.log('Resumed AudioContext for real-time processing');
+                    }
+                    
+                    this.audioStream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            sampleRate: 16000, // Optimized for turn detection
+                            channelCount: 1,
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        }
                     });
                     
-                    this.audioChunks = [];
+                    // Set up real-time audio processing
+                    const source = this.audioContext.createMediaStreamSource(this.audioStream);
+                    this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
                     
-                    this.mediaRecorder.ondataavailable = (event) => {
-                        if (event.data.size > 0) {
-                            this.audioChunks.push(event.data);
+                    source.connect(this.processorNode);
+                    this.processorNode.connect(this.audioContext.destination);
+                    
+                    this.processorNode.onaudioprocess = (event) => {
+                        if (this.isListening && !this.isProcessingTurn) {
+                            this.processAudioChunk(event.inputBuffer);
                         }
                     };
                     
-                    this.mediaRecorder.onstop = () => {
-                        this.processRecording();
-                    };
-                    
-                    this.mediaRecorder.start();
-                    this.isRecording = true;
-                    this.recordBtn.textContent = '🛑 Stop Recording';
-                    this.recordBtn.classList.add('recording');
+                    this.isListening = true;
+                    this.audioBuffer = [];
+                    this.updateListeningStatus('🎧 Listening...', 'listening');
+                    this.toggleBtn.textContent = '🛑 Stop Listening';
+                    this.toggleBtn.classList.add('recording');
                     
                 } catch (error) {
-                    console.error('Error starting recording:', error);
-                    this.addMessage('error', 'Could not access microphone. Please check permissions.');
+                    console.error('Error starting real-time listening:', error);
+                    this.addMessage('error', 'Could not access microphone for real-time listening.');
                 }
             }
 
-            stopRecording() {
-                if (this.mediaRecorder && this.isRecording) {
-                    this.mediaRecorder.stop();
-                    this.mediaRecorder.stream.getTracks().forEach(track => track.stop());
-                    this.isRecording = false;
-                    this.recordBtn.textContent = '🎤 Start Recording';
-                    this.recordBtn.classList.remove('recording');
+            stopListening() {
+                if (this.audioStream) {
+                    this.audioStream.getTracks().forEach(track => track.stop());
                 }
-            }
-
-            async processRecording() {
-                if (this.audioChunks.length === 0) return;
-
-                const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm;codecs=opus' });
                 
-                // Convert to base64
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const base64Audio = reader.result.split(',')[1];
-                    this.sendAudioMessage(base64Audio);
-                };
-                reader.readAsDataURL(audioBlob);
+                if (this.processorNode) {
+                    this.processorNode.disconnect();
+                    this.processorNode = null;
+                }
+                
+                this.isListening = false;
+                this.audioBuffer = [];
+                this.updateListeningStatus('Ready to listen', '');
+                this.toggleBtn.textContent = '🎤 Start Listening';
+                this.toggleBtn.classList.remove('recording');
+                
+                if (this.silenceTimeout) {
+                    clearTimeout(this.silenceTimeout);
+                }
             }
 
-            sendAudioMessage(audioBase64) {
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.addMessage('user', '🎤 [Speaking...]');
+            processAudioChunk(inputBuffer) {
+                // Convert audio buffer to PCM data for turn detection
+                const channelData = inputBuffer.getChannelData(0);
+                const pcmData = new Float32Array(channelData);
+                
+                // Store audio data for later processing
+                this.audioBuffer.push(...pcmData);
+                
+                // Send audio chunk for turn detection every 2 seconds or 32K samples
+                if (this.audioBuffer.length >= 32000) {
+                    this.checkTurnCompletion();
+                }
+            }
+
+            async checkTurnCompletion() {
+                if (this.isProcessingTurn || this.audioBuffer.length === 0) return;
+                
+                try {
+                    // Convert Float32Array to base64 for API
+                    const audioData = new Float32Array(this.audioBuffer);
+                    const audioBytes = new Uint8Array(audioData.buffer);
+                    const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
                     
-                    // Send as binary or JSON - try binary first for efficiency
-                    try {
-                        const binaryString = atob(audioBase64);
-                        const bytes = new Uint8Array(binaryString.length);
-                        for (let i = 0; i < binaryString.length; i++) {
-                            bytes[i] = binaryString.charCodeAt(i);
-                        }
-                        this.ws.send(bytes.buffer);
-                    } catch (error) {
-                        // Fallback to JSON
-                        this.ws.send(JSON.stringify({
-                            type: 'audio',
-                            audio: audioBase64
-                        }));
+                    // Send to turn detection API
+                    const turnDetectionResult = await this.sendTurnDetection(base64Audio);
+                    
+                    if (turnDetectionResult.is_complete && 
+                        turnDetectionResult.probability >= this.turnDetectionThreshold) {
+                        console.log('Turn completion detected with probability:', turnDetectionResult.probability);
+                        await this.processTurnCompletion();
+                    }
+                    
+                    // Keep only recent audio data (sliding window)
+                    if (this.audioBuffer.length > 64000) {
+                        this.audioBuffer = this.audioBuffer.slice(-32000);
+                    }
+                    
+                } catch (error) {
+                    console.error('Turn detection error:', error);
+                }
+            }
+
+            async sendTurnDetection(audioBase64) {
+                return new Promise((resolve, reject) => {
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        const message = JSON.stringify({
+                            type: 'turn_detection',
+                            audio: audioBase64,
+                            dtype: 'float32'
+                        });
+                        
+                        // Set up one-time listener for turn detection response
+                        const originalHandler = this.ws.onmessage;
+                        this.ws.onmessage = (event) => {
+                            try {
+                                const data = JSON.parse(event.data);
+                                if (data.type === 'turn_detection_result') {
+                                    this.ws.onmessage = originalHandler;
+                                    resolve(data.result);
+                                    return;
+                                }
+                            } catch (e) {
+                                // Not a turn detection result, pass to original handler
+                            }
+                            originalHandler(event);
+                        };
+                        
+                        this.ws.send(message);
+                        
+                        // Timeout after 5 seconds
+                        setTimeout(() => {
+                            this.ws.onmessage = originalHandler;
+                            reject(new Error('Turn detection timeout'));
+                        }, 5000);
+                    } else {
+                        reject(new Error('WebSocket not connected'));
+                    }
+                });
+            }
+
+            async processTurnCompletion() {
+                this.isProcessingTurn = true;
+                this.updateListeningStatus('🤔 Processing your speech...', 'processing');
+                
+                try {
+                    // Convert collected audio to format suitable for ASR
+                    const audioData = new Float32Array(this.audioBuffer);
+                    const audioBytes = new Uint8Array(audioData.buffer);
+                    const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
+                    
+                    // Send for ASR processing
+                    this.sendAudioForProcessing(base64Audio);
+                    
+                    // Clear the audio buffer
+                    this.audioBuffer = [];
+                    
+                } catch (error) {
+                    console.error('Turn completion processing error:', error);
+                    this.addMessage('error', 'Failed to process speech turn');
+                } finally {
+                    this.isProcessingTurn = false;
+                    if (this.isListening) {
+                        this.updateListeningStatus('🎧 Listening...', 'listening');
                     }
                 }
             }
 
+            sendAudioForProcessing(audioBase64) {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.addMessage('user', '🎤 [Processing speech...]');
+                    
+                    const message = JSON.stringify({
+                        type: 'audio_processing',
+                        audio: audioBase64
+                    });
+                    this.ws.send(message);
+                }
+            }
+
+            updateListeningStatus(text, className) {
+                this.listeningStatus.textContent = text;
+                this.listeningStatus.className = className;
+            }
+
             handleWebSocketMessage(data) {
-                // Handle both binary audio and JSON messages
+                console.log('Received WebSocket message:', data);
+                
+                // Handle binary audio data (ArrayBuffer or Blob)
                 if (data instanceof ArrayBuffer) {
+                    console.log('Received binary audio data (ArrayBuffer), size:', data.byteLength);
                     this.playBinaryAudio(data);
                     this.addMessage('bot', '🔊 [AI Response]');
                     return;
+                } else if (data instanceof Blob) {
+                    console.log('Received binary audio data (Blob), size:', data.size);
+                    // Convert Blob to ArrayBuffer and play
+                    data.arrayBuffer().then(arrayBuffer => {
+                        this.playBinaryAudio(arrayBuffer);
+                        this.addMessage('bot', '🔊 [AI Response]');
+                    }).catch(error => {
+                        console.error('Error converting Blob to ArrayBuffer:', error);
+                        this.addMessage('error', 'Failed to process audio blob');
+                    });
+                    return;
                 }
                 
-                // Parse JSON messages
-                const message = typeof data === 'string' ? JSON.parse(data) : data;
-                
-                switch (message.type) {
-                    case 'audio':
-                        this.playAudio(message.audio);
-                        this.addMessage('bot', '🔊 [AI Response]');
-                        break;
-                    case 'status':
-                        this.addMessage('status', message.message);
-                        break;
-                    case 'error':
-                        this.addMessage('error', message.message);
-                        break;
+                try {
+                    // Parse JSON messages
+                    const message = typeof data === 'string' ? JSON.parse(data) : data;
+                    console.log('Parsed message:', message);
+                    
+                    switch (message.type) {
+                        case 'audio':
+                            console.log('Received base64 audio');
+                            this.playAudio(message.audio);
+                            this.addMessage('bot', '🔊 [AI Response]');
+                            break;
+                        case 'text':
+                            this.addMessage('bot', message.text);
+                            if (message.message) {
+                                this.addMessage('status', message.message);
+                            }
+                            break;
+                        case 'status':
+                            this.addMessage('status', message.message);
+                            break;
+                        case 'error':
+                            this.addMessage('error', message.message);
+                            break;
+                        default:
+                            console.log('Unknown message type:', message.type);
+                    }
+                } catch (error) {
+                    console.error('Error parsing WebSocket message:', error);
+                    this.addMessage('error', 'Failed to process server response');
                 }
             }
 
             async playBinaryAudio(audioBuffer) {
                 try {
+                    console.log('Starting binary audio playback, buffer size:', audioBuffer.byteLength);
+                    
                     if (!this.audioContext) {
                         this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        console.log('Created new AudioContext');
+                    }
+
+                    // Resume audio context if suspended (required for many browsers)
+                    if (this.audioContext.state === 'suspended') {
+                        await this.audioContext.resume();
+                        console.log('Resumed AudioContext');
                     }
 
                     // Decode and play binary audio
-                    const decodedBuffer = await this.audioContext.decodeAudioData(audioBuffer);
+                    console.log('Decoding audio data...');
+                    const decodedBuffer = await this.audioContext.decodeAudioData(audioBuffer.slice());
+                    console.log('Audio decoded successfully, duration:', decodedBuffer.duration);
+                    
                     const source = this.audioContext.createBufferSource();
                     const gainNode = this.audioContext.createGain();
                     
@@ -484,11 +743,17 @@ const HTML_CONTENT = `
                     source.buffer = decodedBuffer;
                     source.connect(gainNode);
                     gainNode.connect(this.audioContext.destination);
+                    
+                    source.onended = () => {
+                        console.log('Audio playback finished');
+                    };
+                    
                     source.start();
+                    console.log('Audio playback started');
                     
                 } catch (error) {
                     console.error('Binary audio playback error:', error);
-                    this.addMessage('error', 'Could not play audio response');
+                    this.addMessage('error', 'Could not play audio response: ' + error.message);
                 }
             }
 

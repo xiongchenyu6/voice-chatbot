@@ -1,10 +1,17 @@
 name = "voice-chatbot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
+account_id = "2764ae0fd9a5cb92c9ac67708620e54c"
 
-[[durable_objects]]
-binding = "WEBSOCKET_HIBERNATION_SERVER"
-class_name = "WebSocketHibernationServer"
+[durable_objects]
+bindings = [
+  { name = "WEBSOCKET_HIBERNATION_SERVER", class_name = "WebSocketHibernationServer" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebSocketHibernationServer"]
 
 [ai]
 binding = "AI"
+remote = true
