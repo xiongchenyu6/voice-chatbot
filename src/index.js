@@ -378,6 +378,7 @@ const HTML_CONTENT = `
         
         <div class="controls">
             <button id="toggleBtn" class="record-btn">🎤 Start Listening</button>
+            <button id="testBtn" class="record-btn" style="background-color: #6c757d;">🧪 Test Process</button>
             <div class="status-indicator">
                 <span id="listeningStatus">Ready to listen</span>
             </div>
@@ -417,6 +418,7 @@ const HTML_CONTENT = `
             initializeElements() {
                 this.chatArea = document.getElementById('chatArea');
                 this.toggleBtn = document.getElementById('toggleBtn');
+                this.testBtn = document.getElementById('testBtn');
                 this.listeningStatus = document.getElementById('listeningStatus');
                 this.volumeSlider = document.getElementById('volumeSlider');
                 this.volumeValue = document.getElementById('volumeValue');
@@ -425,7 +427,7 @@ const HTML_CONTENT = `
 
             initializeWebSocket() {
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = \`\${protocol}//\${window.location.host}/websocket\`;
+                const wsUrl = protocol + '//' + window.location.host + '/websocket';
                 
                 this.ws = new WebSocket(wsUrl);
                 
@@ -454,14 +456,31 @@ const HTML_CONTENT = `
 
             initializeEventListeners() {
                 this.toggleBtn.addEventListener('click', () => this.toggleListening());
+                this.testBtn.addEventListener('click', () => this.testProcessAudio());
                 this.volumeSlider.addEventListener('input', (e) => {
                     this.volume = parseFloat(e.target.value);
                     this.volumeValue.textContent = Math.round(this.volume * 100) + '%';
                 });
             }
 
+            async testProcessAudio() {
+                if (this.audioBuffer.length === 0) {
+                    this.addMessage('error', 'No audio data to process. Start listening first.');
+                    return;
+                }
+                
+                this.addMessage('system', 'Testing with ' + this.audioBuffer.length + ' audio samples...');
+                
+                try {
+                    await this.performTurnDetection();
+                    this.addMessage('system', 'Test processing completed.');
+                } catch (error) {
+                    this.addMessage('error', 'Test processing failed: ' + error.message);
+                }
+            }
+
             updateConnectionStatus(status, text) {
-                this.connectionStatus.className = \`connection-status \${status}\`;
+                this.connectionStatus.className = 'connection-status ' + status;
                 this.connectionStatus.textContent = text;
             }
 
@@ -557,39 +576,37 @@ const HTML_CONTENT = `
                 // Only create AudioWorklet in browser context
                 if (typeof window === 'undefined') return null;
                 
-                const audioWorkletCode = \`
-                class AudioProcessor extends AudioWorkletProcessor {
-                    constructor() {
-                        super();
-                        this.bufferSize = 4096;
-                        this.buffer = new Float32Array(this.bufferSize);
-                        this.bufferIndex = 0;
-                    }
-                    
-                    process(inputs, outputs, parameters) {
-                        const input = inputs[0];
-                        if (input && input.length > 0) {
-                            const channelData = input[0];
-                            
-                            for (let i = 0; i < channelData.length; i++) {
-                                this.buffer[this.bufferIndex] = channelData[i];
-                                this.bufferIndex++;
-                                
-                                if (this.bufferIndex >= this.bufferSize) {
-                                    // Send buffer to main thread
-                                    this.port.postMessage({
-                                        audioData: new Float32Array(this.buffer)
-                                    });
-                                    this.bufferIndex = 0;
-                                }
-                            }
-                        }
-                        return true;
-                    }
-                }
-                
-                registerProcessor('audio-processor', AudioProcessor);
-                \`;
+                const audioWorkletCode = 
+                    'class AudioProcessor extends AudioWorkletProcessor {' +
+                    '    constructor() {' +
+                    '        super();' +
+                    '        this.bufferSize = 4096;' +
+                    '        this.buffer = new Float32Array(this.bufferSize);' +
+                    '        this.bufferIndex = 0;' +
+                    '    }' +
+                    '    ' +
+                    '    process(inputs, outputs, parameters) {' +
+                    '        const input = inputs[0];' +
+                    '        if (input && input.length > 0) {' +
+                    '            const channelData = input[0];' +
+                    '            ' +
+                    '            for (let i = 0; i < channelData.length; i++) {' +
+                    '                this.buffer[this.bufferIndex] = channelData[i];' +
+                    '                this.bufferIndex++;' +
+                    '                ' +
+                    '                if (this.bufferIndex >= this.bufferSize) {' +
+                    '                    this.port.postMessage({' +
+                    '                        audioData: new Float32Array(this.buffer)' +
+                    '                    });' +
+                    '                    this.bufferIndex = 0;' +
+                    '                }' +
+                    '            }' +
+                    '        }' +
+                    '        return true;' +
+                    '    }' +
+                    '}' +
+                    '' +
+                    'registerProcessor("audio-processor", AudioProcessor);';
                 
                 const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
                 return URL.createObjectURL(blob);
@@ -599,22 +616,56 @@ const HTML_CONTENT = `
                 // Store audio data for later processing
                 this.audioBuffer.push(...audioData);
                 
-                // Throttle turn detection - only check every 2 seconds and if not already processing
+                // TEMPORARY: Disable turn detection to test audio processing stability
+                // TODO: Re-enable once we confirm audio processing is stable
+                /*
+                // Implement proper debouncing with more strict conditions
                 const now = Date.now();
-                if (this.audioBuffer.length >= 32000 && 
-                    !this.isProcessingTurn && 
-                    !this.pendingTurnDetection &&
-                    (now - this.lastTurnDetectionTime) >= this.turnDetectionInterval) {
-                    
+                const hasEnoughData = this.audioBuffer.length >= 32000;
+                const isNotBusy = !this.isProcessingTurn && !this.pendingTurnDetection;
+                const hasWaitedEnough = (now - this.lastTurnDetectionTime) >= this.turnDetectionInterval;
+                
+                if (hasEnoughData && isNotBusy && hasWaitedEnough) {
+                    // Immediately set flags to prevent any other calls
                     this.pendingTurnDetection = true;
                     this.lastTurnDetectionTime = now;
                     
-                    // Use setTimeout to avoid blocking the audio thread
+                    console.log('Scheduling turn detection check...');
+                    
+                    // Use a longer delay and ensure proper async handling
                     setTimeout(() => {
-                        this.checkTurnCompletion().finally(() => {
-                            this.pendingTurnDetection = false;
-                        });
-                    }, 50); // Small delay to avoid blocking
+                        this.performTurnDetection();
+                    }, 100);
+                }
+                */
+                
+                // Just log audio processing to verify it's working
+                if (this.audioBuffer.length % 16000 === 0) {
+                    console.log('Audio buffer size:', this.audioBuffer.length);
+                }
+                
+                // Limit buffer size to prevent memory issues
+                if (this.audioBuffer.length > 96000) {
+                    this.audioBuffer = this.audioBuffer.slice(-64000);
+                    console.log('Audio buffer trimmed to prevent memory issues');
+                }
+            }
+
+            async performTurnDetection() {
+                try {
+                    // Double-check flags before proceeding
+                    if (!this.pendingTurnDetection || this.isProcessingTurn) {
+                        console.log('Turn detection cancelled - flags check failed');
+                        return;
+                    }
+                    
+                    console.log('Starting turn detection...');
+                    await this.checkTurnCompletion();
+                } catch (error) {
+                    console.error('Turn detection error in performTurnDetection:', error);
+                } finally {
+                    this.pendingTurnDetection = false;
+                    console.log('Turn detection completed, flags reset');
                 }
             }
 
@@ -652,21 +703,39 @@ const HTML_CONTENT = `
             }
 
             async checkTurnCompletion() {
-                if (this.isProcessingTurn || this.audioBuffer.length === 0) return;
+                console.log('checkTurnCompletion called, flags:', {
+                    isProcessingTurn: this.isProcessingTurn,
+                    bufferLength: this.audioBuffer.length,
+                    pendingTurnDetection: this.pendingTurnDetection
+                });
                 
-                // Prevent multiple simultaneous turn detection calls
+                // Strict guard conditions - return immediately if busy or no data
+                if (this.isProcessingTurn || this.audioBuffer.length === 0) {
+                    console.log('checkTurnCompletion: early return due to flags');
+                    return;
+                }
+                
+                // Set processing flag immediately to prevent re-entry
                 this.isProcessingTurn = true;
+                console.log('Turn detection processing started');
                 
                 try {
-                    // Convert Float32Array to base64 for API
+                    // Convert Float32Array to base64 for API (limit to 32K samples)
                     const audioData = new Float32Array(this.audioBuffer.slice(0, 32000));
                     const audioBytes = new Uint8Array(audioData.buffer);
                     const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
                     
-                    // Send to turn detection API
-                    const turnDetectionResult = await this.sendTurnDetection(base64Audio);
+                    console.log('Sending turn detection request...');
                     
-                    if (turnDetectionResult.is_complete && 
+                    // Send to turn detection API with timeout
+                    const turnDetectionResult = await Promise.race([
+                        this.sendTurnDetection(base64Audio),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Turn detection timeout')), 5000))
+                    ]);
+                    
+                    console.log('Turn detection result:', turnDetectionResult);
+                    
+                    if (turnDetectionResult && turnDetectionResult.is_complete && 
                         turnDetectionResult.probability >= this.turnDetectionThreshold) {
                         console.log('Turn completion detected with probability:', turnDetectionResult.probability);
                         await this.processTurnCompletion();
@@ -680,8 +749,9 @@ const HTML_CONTENT = `
                 } catch (error) {
                     console.error('Turn detection error:', error);
                 } finally {
-                    // Always reset the flag
+                    // Always reset the processing flag
                     this.isProcessingTurn = false;
+                    console.log('checkTurnCompletion: processing flag reset');
                 }
             }
 
