@@ -491,24 +491,27 @@ const HTML_CONTENT = `
                     console.log('Audio bytes length:', audioBytes.length);
                     console.log('First 16 bytes:', Array.from(audioBytes.slice(0, 16)));
                     
-                    // Create base64 using safe chunked approach
-                    let base64Audio = '';
-                    const chunkSize = 1024; // Smaller chunks for safety
-                    
-                    for (let i = 0; i < audioBytes.length; i += chunkSize) {
-                        const chunk = audioBytes.slice(i, i + chunkSize);
-                        const chunkArray = Array.from(chunk);
-                        const chunkString = String.fromCharCode.apply(null, chunkArray);
-                        base64Audio += btoa(chunkString);
-                    }
+                    // Use modern approach with FileReader for reliable base64 conversion
+                    const base64Audio = await new Promise((resolve, reject) => {
+                        const blob = new Blob([audioBytes]);
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            const dataUrl = reader.result;
+                            // Remove data:application/octet-stream;base64, prefix
+                            const base64 = dataUrl.split(',')[1];
+                            resolve(base64);
+                        };
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
                     
                     console.log('Base64 audio length:', base64Audio.length);
                     console.log('Base64 sample (first 100 chars):', base64Audio.substring(0, 100));
                     
                     // Validate base64 before sending
                     try {
-                        atob(base64Audio); // Test decode
-                        console.log('Base64 validation passed');
+                        const decoded = atob(base64Audio);
+                        console.log('Base64 validation passed, decoded length:', decoded.length);
                     } catch (validateError) {
                         throw new Error('Generated invalid base64: ' + validateError.message);
                     }
@@ -783,16 +786,18 @@ const HTML_CONTENT = `
                     // Convert to bytes properly
                     const audioBytes = new Uint8Array(pcm16.buffer);
                     
-                    // Create base64 using safe chunked approach
-                    let base64Audio = '';
-                    const chunkSize = 1024;
-                    
-                    for (let i = 0; i < audioBytes.length; i += chunkSize) {
-                        const chunk = audioBytes.slice(i, i + chunkSize);
-                        const chunkArray = Array.from(chunk);
-                        const chunkString = String.fromCharCode.apply(null, chunkArray);
-                        base64Audio += btoa(chunkString);
-                    }
+                    // Use FileReader for reliable base64 conversion
+                    const base64Audio = await new Promise((resolve, reject) => {
+                        const blob = new Blob([audioBytes]);
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            const dataUrl = reader.result;
+                            const base64 = dataUrl.split(',')[1];
+                            resolve(base64);
+                        };
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
                     
                     console.log('Sending turn detection request with', maxSamples, 'samples...');
                     
