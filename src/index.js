@@ -492,18 +492,48 @@ const HTML_CONTENT = `
                         }
                     });
                     
-                    // Set up real-time audio processing
+                    // Set up real-time audio processing using modern approach
                     const source = this.audioContext.createMediaStreamSource(this.audioStream);
-                    this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+                    
+                    // Try to use AudioWorkletNode, fallback to ScriptProcessorNode
+                    try {
+                        // Check if AudioWorklet is supported and we're in browser context
+                        if (typeof window !== 'undefined' && 
+                            this.audioContext.audioWorklet && 
+                            typeof AudioWorkletNode !== 'undefined') {
+                            
+                            // Load audio worklet processor
+                            const workletBlob = this.createAudioWorkletBlob();
+                            if (workletBlob) {
+                                await this.audioContext.audioWorklet.addModule(workletBlob);
+                                
+                                this.processorNode = new AudioWorkletNode(this.audioContext, 'audio-processor');
+                                this.processorNode.port.onmessage = (event) => {
+                                    if (this.isListening && !this.isProcessingTurn) {
+                                        this.processAudioData(event.data.audioData);
+                                    }
+                                };
+                                console.log('Using modern AudioWorkletNode');
+                            } else {
+                                throw new Error('Failed to create AudioWorklet blob');
+                            }
+                        } else {
+                            throw new Error('AudioWorklet not supported');
+                        }
+                        
+                    } catch (workletError) {
+                        console.log('AudioWorkletNode failed, using ScriptProcessorNode fallback:', workletError.message);
+                        // Fallback to ScriptProcessorNode
+                        this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+                        this.processorNode.onaudioprocess = (event) => {
+                            if (this.isListening && !this.isProcessingTurn) {
+                                this.processAudioChunk(event.inputBuffer);
+                            }
+                        };
+                    }
                     
                     source.connect(this.processorNode);
                     this.processorNode.connect(this.audioContext.destination);
-                    
-                    this.processorNode.onaudioprocess = (event) => {
-                        if (this.isListening && !this.isProcessingTurn) {
-                            this.processAudioChunk(event.inputBuffer);
-                        }
-                    };
                     
                     this.isListening = true;
                     this.audioBuffer = [];
@@ -514,6 +544,59 @@ const HTML_CONTENT = `
                 } catch (error) {
                     console.error('Error starting real-time listening:', error);
                     this.addMessage('error', 'Could not access microphone for real-time listening.');
+                }
+            }
+
+            createAudioWorkletBlob() {
+                // Only create AudioWorklet in browser context
+                if (typeof window === 'undefined') return null;
+                
+                const audioWorkletCode = \`
+                class AudioProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.bufferSize = 4096;
+                        this.buffer = new Float32Array(this.bufferSize);
+                        this.bufferIndex = 0;
+                    }
+                    
+                    process(inputs, outputs, parameters) {
+                        const input = inputs[0];
+                        if (input && input.length > 0) {
+                            const channelData = input[0];
+                            
+                            for (let i = 0; i < channelData.length; i++) {
+                                this.buffer[this.bufferIndex] = channelData[i];
+                                this.bufferIndex++;
+                                
+                                if (this.bufferIndex >= this.bufferSize) {
+                                    // Send buffer to main thread
+                                    this.port.postMessage({
+                                        audioData: new Float32Array(this.buffer)
+                                    });
+                                    this.bufferIndex = 0;
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                }
+                
+                registerProcessor('audio-processor', AudioProcessor);
+                \`;
+                
+                const blob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+                return URL.createObjectURL(blob);
+            }
+
+            processAudioData(audioData) {
+                // Store audio data for later processing
+                this.audioBuffer.push(...audioData);
+                
+                // Send audio chunk for turn detection every 32K samples
+                // Use setTimeout to prevent recursive stack overflow
+                if (this.audioBuffer.length >= 32000 && !this.isProcessingTurn) {
+                    setTimeout(() => this.checkTurnCompletion(), 0);
                 }
             }
 
@@ -547,17 +630,21 @@ const HTML_CONTENT = `
                 this.audioBuffer.push(...pcmData);
                 
                 // Send audio chunk for turn detection every 2 seconds or 32K samples
-                if (this.audioBuffer.length >= 32000) {
-                    this.checkTurnCompletion();
+                // Use setTimeout to prevent recursive stack overflow
+                if (this.audioBuffer.length >= 32000 && !this.isProcessingTurn) {
+                    setTimeout(() => this.checkTurnCompletion(), 0);
                 }
             }
 
             async checkTurnCompletion() {
                 if (this.isProcessingTurn || this.audioBuffer.length === 0) return;
                 
+                // Prevent multiple simultaneous turn detection calls
+                this.isProcessingTurn = true;
+                
                 try {
                     // Convert Float32Array to base64 for API
-                    const audioData = new Float32Array(this.audioBuffer);
+                    const audioData = new Float32Array(this.audioBuffer.slice(0, 32000));
                     const audioBytes = new Uint8Array(audioData.buffer);
                     const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
                     
@@ -577,71 +664,83 @@ const HTML_CONTENT = `
                     
                 } catch (error) {
                     console.error('Turn detection error:', error);
+                } finally {
+                    // Always reset the flag
+                    this.isProcessingTurn = false;
                 }
             }
 
             async sendTurnDetection(audioBase64) {
                 return new Promise((resolve, reject) => {
-                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        const message = JSON.stringify({
-                            type: 'turn_detection',
-                            audio: audioBase64,
-                            dtype: 'float32'
-                        });
-                        
-                        // Set up one-time listener for turn detection response
-                        const originalHandler = this.ws.onmessage;
-                        this.ws.onmessage = (event) => {
-                            try {
-                                const data = JSON.parse(event.data);
-                                if (data.type === 'turn_detection_result') {
-                                    this.ws.onmessage = originalHandler;
-                                    resolve(data.result);
-                                    return;
-                                }
-                            } catch (e) {
-                                // Not a turn detection result, pass to original handler
-                            }
-                            originalHandler(event);
-                        };
-                        
-                        this.ws.send(message);
-                        
-                        // Timeout after 5 seconds
-                        setTimeout(() => {
-                            this.ws.onmessage = originalHandler;
-                            reject(new Error('Turn detection timeout'));
-                        }, 5000);
-                    } else {
+                    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
                         reject(new Error('WebSocket not connected'));
+                        return;
                     }
+                    
+                    const timeoutId = setTimeout(() => {
+                        reject(new Error('Turn detection timeout'));
+                    }, 3000); // Reduced timeout to 3 seconds
+                    
+                    const message = JSON.stringify({
+                        type: 'turn_detection',
+                        audio: audioBase64,
+                        dtype: 'float32'
+                    });
+                    
+                    // Set up one-time listener for turn detection response
+                    const originalHandler = this.ws.onmessage;
+                    const responseHandler = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'turn_detection_result') {
+                                clearTimeout(timeoutId);
+                                this.ws.onmessage = originalHandler;
+                                resolve(data.result);
+                                return;
+                            }
+                        } catch (e) {
+                            // Not a turn detection result, pass to original handler
+                        }
+                        // Pass through to original handler
+                        if (originalHandler) {
+                            originalHandler(event);
+                        }
+                    };
+                    
+                    this.ws.onmessage = responseHandler;
+                    this.ws.send(message);
                 });
             }
 
             async processTurnCompletion() {
+                if (this.isProcessingTurn) return; // Prevent multiple simultaneous processing
+                
                 this.isProcessingTurn = true;
                 this.updateListeningStatus('🤔 Processing your speech...', 'processing');
                 
                 try {
                     // Convert collected audio to format suitable for ASR
-                    const audioData = new Float32Array(this.audioBuffer);
+                    const audioData = new Float32Array(this.audioBuffer.slice(0, 32000));
                     const audioBytes = new Uint8Array(audioData.buffer);
                     const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
                     
                     // Send for ASR processing
                     this.sendAudioForProcessing(base64Audio);
                     
-                    // Clear the audio buffer
-                    this.audioBuffer = [];
+                    // Clear the processed audio buffer
+                    this.audioBuffer = this.audioBuffer.slice(32000);
                     
                 } catch (error) {
                     console.error('Turn completion processing error:', error);
                     this.addMessage('error', 'Failed to process speech turn');
                 } finally {
-                    this.isProcessingTurn = false;
-                    if (this.isListening) {
-                        this.updateListeningStatus('🎧 Listening...', 'listening');
-                    }
+                    // Reset processing flag after a delay to allow ASR to complete
+                    setTimeout(() => {
+                        this.isProcessingTurn = false;
+                        if (this.isListening) {
+                            this.updateListeningStatus('🎧 Listening...', 'listening');
+                        }
+                    }, 1000);
                 }
             }
 
