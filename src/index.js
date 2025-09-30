@@ -145,8 +145,16 @@ export class WebSocketHibernationServer {
       // ASR: Convert speech to text using Whisper
       try {
         console.log('Running Whisper ASR...');
+        
+        // Whisper expects an array of numbers (Float32 audio data)
+        // Let's ensure we pass the right format
+        const audioArray = Array.from(audioBuffer);
+        console.log('Audio array length:', audioArray.length);
+        console.log('Audio sample values (first 10):', audioArray.slice(0, 10));
+        console.log('Audio range - min:', Math.min(...audioArray), 'max:', Math.max(...audioArray));
+        
         const transcriptionResult = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
-          audio: [...audioBuffer]
+          audio: audioArray
         });
 
         console.log('Whisper result:', transcriptionResult);
@@ -521,6 +529,15 @@ const HTML_CONTENT = `
                     
                     console.log('Audio data sample:', audioData.slice(0, 10));
                     
+                    // Check if audio contains actual sound (not just silence)
+                    const audioLevel = this.calculateAudioLevel(audioData);
+                    console.log('Audio level (RMS):', audioLevel);
+                    
+                    if (audioLevel < 0.001) {
+                        this.addMessage('error', 'Audio level too low (' + audioLevel.toFixed(6) + '). Please speak louder or check microphone.');
+                        return;
+                    }
+                    
                     // Convert Float32 PCM to 16-bit PCM for better compatibility
                     const pcm16 = new Int16Array(audioData.length);
                     for (let i = 0; i < audioData.length; i++) {
@@ -533,6 +550,15 @@ const HTML_CONTENT = `
                     
                     console.log('Audio bytes length:', audioBytes.length);
                     console.log('First 16 bytes:', Array.from(audioBytes.slice(0, 16)));
+                    
+                    // Check if we have non-zero audio data
+                    const nonZeroBytes = audioBytes.filter(b => b !== 0).length;
+                    console.log('Non-zero bytes:', nonZeroBytes, '/', audioBytes.length);
+                    
+                    if (nonZeroBytes < audioBytes.length * 0.1) {
+                        this.addMessage('error', 'Audio contains mostly silence. Please speak during recording.');
+                        return;
+                    }
                     
                     // Use modern approach with FileReader for reliable base64 conversion
                     const base64Audio = await new Promise((resolve, reject) => {
@@ -561,7 +587,7 @@ const HTML_CONTENT = `
                     
                     // Send for ASR processing
                     this.sendAudioForProcessing(base64Audio);
-                    this.addMessage('system', 'Audio sent for processing...');
+                    this.addMessage('system', 'Audio sent for processing (level: ' + audioLevel.toFixed(4) + ')...');
                     
                     // Clear processed samples
                     this.audioBuffer = this.audioBuffer.slice(maxSamples);
@@ -570,6 +596,15 @@ const HTML_CONTENT = `
                     console.error('Processing error:', error);
                     this.addMessage('error', 'Test processing failed: ' + error.message);
                 }
+            }
+
+            calculateAudioLevel(audioData) {
+                // Calculate RMS (Root Mean Square) level
+                let sum = 0;
+                for (let i = 0; i < audioData.length; i++) {
+                    sum += audioData[i] * audioData[i];
+                }
+                return Math.sqrt(sum / audioData.length);
             }
 
             updateConnectionStatus(status, text) {
@@ -735,9 +770,12 @@ const HTML_CONTENT = `
                 }
                 */
                 
-                // Just log audio processing periodically
+                // Log audio processing periodically with level check
                 if (this.audioBuffer.length % 16000 === 0) {
-                    console.log('Audio buffer size:', this.audioBuffer.length, '- Use Test button to manually process');
+                    // Calculate current audio level for debugging
+                    const recentAudio = new Float32Array(this.audioBuffer.slice(-4000)); // Last 4000 samples
+                    const level = this.calculateAudioLevel(recentAudio);
+                    console.log('Audio buffer size:', this.audioBuffer.length, '- Recent level:', level.toFixed(6), '- Use Process button to manually process');
                 }
                 
                 // Limit buffer size to prevent memory issues
@@ -961,6 +999,15 @@ const HTML_CONTENT = `
             updateListeningStatus(text, className) {
                 this.listeningStatus.textContent = text;
                 this.listeningStatus.className = className;
+                
+                // Add real-time audio level indicator
+                if (className === 'listening' && this.audioBuffer.length > 0) {
+                    const recentSamples = Math.min(1000, this.audioBuffer.length);
+                    const recentAudio = new Float32Array(this.audioBuffer.slice(-recentSamples));
+                    const level = this.calculateAudioLevel(recentAudio);
+                    const levelPercent = Math.min(100, level * 1000); // Scale for display
+                    this.listeningStatus.textContent = text + ' (Level: ' + levelPercent.toFixed(1) + '%)';
+                }
             }
 
             handleWebSocketMessage(data) {
