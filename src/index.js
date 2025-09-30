@@ -53,10 +53,40 @@ export class WebSocketHibernationServer {
           await this.handleTurnDetection(ws, data);
           return;
         } else if (data.type === 'audio_processing') {
-          // Process complete audio for ASR
-          const audioBuffer = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
-          await this.handleAudioInput(ws, audioBuffer);
-          return;
+          // Process complete audio for ASR - convert base64 back to proper audio format
+          console.log('Received audio_processing request, base64 length:', data.audio.length);
+          
+          try {
+            // Decode base64 to get the 16-bit PCM data
+            const binaryString = atob(data.audio);
+            const audioBytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              audioBytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            console.log('Decoded audio bytes length:', audioBytes.length);
+            
+            // Convert back to Int16Array (since we encoded 16-bit PCM)
+            const pcm16Array = new Int16Array(audioBytes.buffer);
+            console.log('PCM16 samples count:', pcm16Array.length);
+            
+            // Convert 16-bit PCM back to Float32 for Whisper (-1.0 to 1.0 range)
+            const float32Audio = new Float32Array(pcm16Array.length);
+            for (let i = 0; i < pcm16Array.length; i++) {
+              float32Audio[i] = pcm16Array[i] / 32767.0; // Convert back to -1.0 to 1.0 range
+            }
+            
+            console.log('Float32 audio samples:', float32Audio.length);
+            console.log('Audio sample values:', Array.from(float32Audio.slice(0, 10)));
+            
+            await this.handleAudioInput(ws, float32Audio);
+            return;
+            
+          } catch (decodeError) {
+            console.error('Audio decode error:', decodeError);
+            ws.send(JSON.stringify({ type: 'error', message: 'Failed to decode audio: ' + decodeError.message }));
+            return;
+          }
         } else if (data.type === 'audio' && data.audio) {
           // Legacy audio handling
           const audioBuffer = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
@@ -110,24 +140,37 @@ export class WebSocketHibernationServer {
       // Send processing status (optional - could remove for pure audio stream)
       ws.send(JSON.stringify({ type: 'status', message: 'Processing...' }));
 
+      console.log('Processing audio input, buffer size:', audioBuffer.length);
+
       // ASR: Convert speech to text using Whisper
-      const transcriptionResult = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
-        audio: [...audioBuffer]
-      });
+      try {
+        console.log('Running Whisper ASR...');
+        const transcriptionResult = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
+          audio: [...audioBuffer]
+        });
 
-      const transcribedText = transcriptionResult.text || '';
-      
-      if (!transcribedText.trim()) {
-        ws.send(JSON.stringify({ type: 'error', message: 'No speech detected' }));
-        return;
+        console.log('Whisper result:', transcriptionResult);
+
+        const transcribedText = transcriptionResult.text || '';
+        console.log('Transcribed text:', transcribedText);
+        
+        if (!transcribedText.trim()) {
+          console.log('No speech detected in audio');
+          ws.send(JSON.stringify({ type: 'error', message: 'No speech detected' }));
+          return;
+        }
+
+        // Process the transcribed text and respond with audio
+        await this.processAndRespondWithAudio(ws, transcribedText);
+
+      } catch (asrError) {
+        console.error('ASR (Whisper) error:', asrError);
+        ws.send(JSON.stringify({ type: 'error', message: 'Speech recognition failed: ' + asrError.message }));
       }
-
-      // Process the transcribed text and respond with audio
-      await this.processAndRespondWithAudio(ws, transcribedText);
 
     } catch (error) {
       console.error('Audio processing error:', error);
-      ws.send(JSON.stringify({ type: 'error', message: 'Audio processing failed' }));
+      ws.send(JSON.stringify({ type: 'error', message: 'Audio processing failed: ' + error.message }));
     }
   }
 
