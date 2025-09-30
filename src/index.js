@@ -1,27 +1,27 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    
-    if (url.pathname === '/') {
+
+    if (url.pathname === "/") {
       return new Response(HTML_CONTENT, {
-        headers: { 'Content-Type': 'text/html' }
+        headers: { "Content-Type": "text/html" },
       });
     }
-    
-    if (url.pathname === '/websocket') {
-      const upgradeHeader = request.headers.get('Upgrade');
-      if (!upgradeHeader || upgradeHeader !== 'websocket') {
-        return new Response('Expected Upgrade: websocket', { status: 426 });
+
+    if (url.pathname === "/websocket") {
+      const upgradeHeader = request.headers.get("Upgrade");
+      if (!upgradeHeader || upgradeHeader !== "websocket") {
+        return new Response("Expected Upgrade: websocket", { status: 426 });
       }
 
       const id = env.WEBSOCKET_HIBERNATION_SERVER.newUniqueId();
       const stub = env.WEBSOCKET_HIBERNATION_SERVER.get(id);
-      
+
       return stub.fetch(request);
     }
-    
-    return new Response('Not found', { status: 404 });
-  }
+
+    return new Response("Not found", { status: 404 });
+  },
 };
 
 export class WebSocketHibernationServer {
@@ -45,140 +45,214 @@ export class WebSocketHibernationServer {
   async webSocketMessage(ws, message) {
     try {
       // Handle different message types
-      if (typeof message === 'string') {
+      if (typeof message === "string") {
         // JSON message with different types
         const data = JSON.parse(message);
-        
-        if (data.type === 'turn_detection') {
+
+        if (data.type === "turn_detection") {
           await this.handleTurnDetection(ws, data);
           return;
-        } else if (data.type === 'audio_processing') {
+        } else if (data.type === "audio_processing") {
           // Process complete audio for ASR - convert base64 back to proper audio format
-          console.log('Received audio_processing request, base64 length:', data.audio.length);
-          
+          console.log(
+            "Received audio_processing request, base64 length:",
+            data.audio.length,
+          );
+
           try {
             // Decode base64 to get the 16-bit PCM data
             const binaryString = atob(data.audio);
-            const audioBytes = new Uint8Array(binaryString.length);
+            const pcm16Bytes = new Uint8Array(binaryString.length);
             for (let i = 0; i < binaryString.length; i++) {
-              audioBytes[i] = binaryString.charCodeAt(i);
+              pcm16Bytes[i] = binaryString.charCodeAt(i);
             }
-            
-            console.log('Decoded audio bytes length:', audioBytes.length);
-            
-            // Convert back to Int16Array (since we encoded 16-bit PCM)
-            const pcm16Array = new Int16Array(audioBytes.buffer);
-            console.log('PCM16 samples count:', pcm16Array.length);
-            
-            // Convert 16-bit PCM back to Float32 for Whisper (-1.0 to 1.0 range)
-            const float32Audio = new Float32Array(pcm16Array.length);
-            for (let i = 0; i < pcm16Array.length; i++) {
-              float32Audio[i] = pcm16Array[i] / 32767.0; // Convert back to -1.0 to 1.0 range
-            }
-            
-            console.log('Float32 audio samples:', float32Audio.length);
-            console.log('Audio sample values:', Array.from(float32Audio.slice(0, 10)));
-            
-            await this.handleAudioInput(ws, float32Audio);
+
+            console.log(
+              "Decoded 16-bit PCM audio bytes length:",
+              pcm16Bytes.length,
+            );
+
+            // Pass the raw PCM bytes to the handler, which will add the WAV header
+            await this.handleAudioInput(ws, pcm16Bytes);
             return;
-            
           } catch (decodeError) {
-            console.error('Audio decode error:', decodeError);
-            ws.send(JSON.stringify({ type: 'error', message: 'Failed to decode audio: ' + decodeError.message }));
+            console.error("Audio decode error:", decodeError);
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Failed to decode audio: " + decodeError.message,
+              }),
+            );
             return;
           }
-        } else if (data.type === 'audio' && data.audio) {
-          // Legacy audio handling
-          const audioBuffer = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
-          await this.handleAudioInput(ws, audioBuffer);
-          return;
         } else {
-          ws.send(JSON.stringify({ type: 'error', message: 'Expected audio data or turn detection' }));
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Expected audio_processing data or turn detection",
+            }),
+          );
           return;
         }
       } else {
-        // Direct binary audio data (legacy)
-        const audioBuffer = new Uint8Array(message);
-        await this.handleAudioInput(ws, audioBuffer);
+        // Direct binary audio data is not expected in this version
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Unexpected binary message format",
+          }),
+        );
       }
-      
     } catch (error) {
-      console.error('WebSocket message error:', error);
-      ws.send(JSON.stringify({ type: 'error', message: error.message }));
+      console.error("WebSocket message error:", error);
+      ws.send(JSON.stringify({ type: "error", message: error.message }));
     }
+  }
+
+  createWavHeader(dataLength, sampleRate, channels, bitsPerSample) {
+    const buffer = new ArrayBuffer(44);
+    const view = new DataView(buffer);
+
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+
+    // RIFF chunk descriptor
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataLength, true); // ChunkSize
+    writeString(8, "WAVE");
+
+    // "fmt " sub-chunk
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+    view.setUint16(20, 1, true); // AudioFormat (1 for PCM)
+    view.setUint16(22, channels, true); // NumChannels
+    view.setUint32(24, sampleRate, true); // SampleRate
+    view.setUint32(28, sampleRate * channels * (bitsPerSample / 8), true); // ByteRate
+    view.setUint16(32, channels * (bitsPerSample / 8), true); // BlockAlign
+    view.setUint16(34, bitsPerSample, true); // BitsPerSample
+
+    // "data" sub-chunk
+    writeString(36, "data");
+    view.setUint32(40, dataLength, true); // Subchunk2Size
+
+    return new Uint8Array(buffer);
   }
 
   async handleTurnDetection(ws, data) {
     try {
-      console.log('Processing turn detection request');
-      
+      console.log("Processing turn detection request");
+
       // Use the smart turn detection model
-      const turnResult = await this.env.AI.run('@cf/pipecat-ai/smart-turn-v2', {
-        audio: data.audio,
-        dtype: data.dtype || 'float32'
+      const binaryString = atob(data.audio);
+      const audioBytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        audioBytes[i] = binaryString.charCodeAt(i);
+      }
+      const pcm16Array = new Int16Array(audioBytes.buffer);
+      const float32Audio = new Float32Array(pcm16Array.length);
+      for (let i = 0; i < pcm16Array.length; i++) {
+        float32Audio[i] = pcm16Array[i] / 32767.0;
+      }
+
+      const turnResult = await this.env.AI.run("@cf/pipecat-ai/smart-turn-v2", {
+        audio: Array.from(float32Audio),
+        dtype: data.dtype || "float32",
       });
 
-      console.log('Turn detection result:', turnResult);
-      
-      // Send result back to client
-      ws.send(JSON.stringify({
-        type: 'turn_detection_result',
-        result: turnResult
-      }));
+      console.log("Turn detection result:", turnResult);
 
+      // Send result back to client
+      ws.send(
+        JSON.stringify({
+          type: "turn_detection_result",
+          result: turnResult,
+        }),
+      );
     } catch (error) {
-      console.error('Turn detection error:', error);
-      ws.send(JSON.stringify({ 
-        type: 'turn_detection_result', 
-        result: { is_complete: false, probability: 0 }
-      }));
+      console.error("Turn detection error:", error);
+      ws.send(
+        JSON.stringify({
+          type: "turn_detection_result",
+          result: { is_complete: false, probability: 0 },
+        }),
+      );
     }
   }
 
-  async handleAudioInput(ws, audioBuffer) {
+  async handleAudioInput(ws, pcm16Data) {
     try {
       // Send processing status (optional - could remove for pure audio stream)
-      ws.send(JSON.stringify({ type: 'status', message: 'Processing...' }));
+      ws.send(JSON.stringify({ type: "status", message: "Processing..." }));
 
-      console.log('Processing audio input, buffer size:', audioBuffer.length);
+      console.log(
+        "Processing audio input, 16-bit PCM buffer size:",
+        pcm16Data.byteLength,
+      );
 
       // ASR: Convert speech to text using Whisper
       try {
-        console.log('Running Whisper ASR...');
-        
-        // Whisper expects an array of numbers (Float32 audio data)
-        // Let's ensure we pass the right format
-        const audioArray = Array.from(audioBuffer);
-        console.log('Audio array length:', audioArray.length);
-        console.log('Audio sample values (first 10):', audioArray.slice(0, 10));
-        console.log('Audio range - min:', Math.min(...audioArray), 'max:', Math.max(...audioArray));
-        
-        const transcriptionResult = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
-          audio: audioArray
-        });
+        console.log("Running Whisper ASR...");
 
-        console.log('Whisper result:', transcriptionResult);
+        // Create a WAV file in memory to send to Whisper
+        const wavHeader = this.createWavHeader(
+          pcm16Data.byteLength,
+          16000,
+          1,
+          16,
+        );
+        const wavBytes = new Uint8Array(
+          wavHeader.byteLength + pcm16Data.byteLength,
+        );
+        wavBytes.set(wavHeader, 0);
+        wavBytes.set(pcm16Data, wavHeader.byteLength);
 
-        const transcribedText = transcriptionResult.text || '';
-        console.log('Transcribed text:', transcribedText);
-        
+        // Per official example, send the raw bytes of the file as an array of numbers
+        const audioArray = [...wavBytes];
+
+        console.log("Total WAV bytes sent to AI:", audioArray.length);
+
+        const transcriptionResult = await this.env.AI.run(
+          "@cf/openai/whisper-tiny-en",
+          {
+            audio: audioArray,
+          },
+        );
+
+        console.log("Whisper result:", transcriptionResult);
+
+        const transcribedText = transcriptionResult.text || "";
+        console.log("Transcribed text:", transcribedText);
+
         if (!transcribedText.trim()) {
-          console.log('No speech detected in audio');
-          ws.send(JSON.stringify({ type: 'error', message: 'No speech detected' }));
+          console.log("No speech detected in audio");
+          ws.send(
+            JSON.stringify({ type: "error", message: "No speech detected" }),
+          );
           return;
         }
 
         // Process the transcribed text and respond with audio
         await this.processAndRespondWithAudio(ws, transcribedText);
-
       } catch (asrError) {
-        console.error('ASR (Whisper) error:', asrError);
-        ws.send(JSON.stringify({ type: 'error', message: 'Speech recognition failed: ' + asrError.message }));
+        console.error("ASR (Whisper) error:", asrError);
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Speech recognition failed: " + asrError.message,
+          }),
+        );
       }
-
     } catch (error) {
-      console.error('Audio processing error:', error);
-      ws.send(JSON.stringify({ type: 'error', message: 'Audio processing failed: ' + error.message }));
+      console.error("Audio processing error:", error);
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "Audio processing failed: " + error.message,
+        }),
+      );
     }
   }
 
@@ -187,84 +261,175 @@ export class WebSocketHibernationServer {
       // LLM: Generate response using GPT OSS 120B
       let chatResponse;
       try {
-        console.log('Generating response with GPT OSS 120B');
-        chatResponse = await this.env.AI.run('@cf/openai/gpt-oss-120b', {
-          instructions: 'You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech. Respond in a friendly, engaging manner suitable for voice interaction.',
-          input: inputText
+        console.log("Generating response with GPT OSS 120B");
+        chatResponse = await this.env.AI.run("@cf/openai/gpt-oss-120b", {
+          instructions:
+            "You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech. Respond in a friendly, engaging manner suitable for voice interaction.",
+          input: inputText,
         });
       } catch (llmError) {
-        console.log('GPT OSS 120B failed, trying Llama fallback:', llmError.message);
+        console.log(
+          "GPT OSS 120B failed, trying Llama fallback:",
+          llmError.message,
+        );
         // Fallback to Llama if GPT OSS fails
         try {
-          chatResponse = await this.env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-            messages: [
-              { role: 'system', content: 'You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech.' },
-              { role: 'user', content: inputText }
-            ]
-          });
+          chatResponse = await this.env.AI.run(
+            "@cf/meta/llama-3.1-8b-instruct",
+            {
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech.",
+                },
+                { role: "user", content: inputText },
+              ],
+            },
+          );
         } catch (fallbackError) {
-          console.log('Llama fallback also failed:', fallbackError.message);
-          chatResponse = { response: 'I apologize, but I could not generate a response at this time.' };
+          console.log("Llama fallback also failed:", fallbackError.message);
+          chatResponse = {
+            response:
+              "I apologize, but I could not generate a response at this time.",
+          };
         }
       }
 
-      const responseText = chatResponse.response || chatResponse.output || 'I apologize, but I could not generate a response.';
-      console.log('LLM Response:', responseText);
+      let responseText;
+
+      // Handle the object-based response from Llama
+      if (
+        chatResponse &&
+        typeof chatResponse === "object" &&
+        !Array.isArray(chatResponse) &&
+        (chatResponse.response || chatResponse.output)
+      ) {
+        responseText = chatResponse.response || chatResponse.output;
+      }
+      // Handle the array-based response from models like gpt-oss-120b
+      else if (Array.isArray(chatResponse)) {
+        const assistantMessage = chatResponse.find(
+          (m) => m.role === "assistant",
+        );
+        // Guessing the content structure, as the log was truncated
+        if (
+          assistantMessage &&
+          Array.isArray(assistantMessage.content) &&
+          assistantMessage.content.length > 0 &&
+          assistantMessage.content[0].text
+        ) {
+          responseText = assistantMessage.content[0].text;
+        }
+      }
+
+      // Final fallback
+      if (!responseText || typeof responseText !== "string") {
+        console.error(
+          "Could not extract a valid string response from LLM output:",
+          chatResponse,
+        );
+        responseText =
+          "I apologize, but I could not generate a response at this time.";
+      }
+      console.log("Extracted LLM Response:", responseText);
 
       // TTS: Use Deepgram Aura with returnRawResponse option
       let ttsResult = null;
       try {
-        console.log('Using TTS model: @cf/deepgram/aura-1');
-        ttsResult = await this.env.AI.run("@cf/deepgram/aura-1", {
-          text: responseText
-        }, {
-          returnRawResponse: true
-        });
-        console.log('TTS success with @cf/deepgram/aura-1');
+        console.log("Using TTS model: @cf/deepgram/aura-1");
+        // Reverting to the documented string format, as the service is unstable.
+        ttsResult = await this.env.AI.run(
+          "@cf/deepgram/aura-1",
+          {
+            text: responseText,
+          },
+          {
+            returnRawResponse: true,
+          },
+        );
+        console.log("TTS success with @cf/deepgram/aura-1");
       } catch (ttsError) {
-        console.log('TTS failed with @cf/deepgram/aura-1:', ttsError.message);
-        ws.send(JSON.stringify({ type: 'error', message: 'TTS failed: ' + ttsError.message }));
+        console.log("TTS failed with @cf/deepgram/aura-1:", ttsError.message);
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "TTS failed: " + ttsError.message,
+          }),
+        );
         return;
       }
 
       // Send the raw response directly
-      console.log('TTS result type:', typeof ttsResult, 'instanceof Response:', ttsResult instanceof Response);
-      
+      console.log(
+        "TTS result type:",
+        typeof ttsResult,
+        "instanceof Response:",
+        ttsResult instanceof Response,
+      );
+
       if (ttsResult instanceof Response) {
+        // Log headers to check the content type
+        const contentType = ttsResult.headers.get("Content-Type");
+        console.log("TTS Response Content-Type:", contentType);
+
+        // If it's not an audio type, it might be an error message.
+        if (contentType && !contentType.startsWith("audio/")) {
+          const errorText = await ttsResult.text();
+          console.error("TTS returned non-audio response:", errorText);
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "TTS failed to generate valid audio: " + errorText,
+            }),
+          );
+          return;
+        }
+
         // If it's a Response object, get the arrayBuffer
-        console.log('Getting arrayBuffer from Response object');
+        console.log("Getting arrayBuffer from Response object");
         const audioBuffer = await ttsResult.arrayBuffer();
-        console.log('Audio buffer size:', audioBuffer.byteLength);
+        console.log("Audio buffer size:", audioBuffer.byteLength);
         ws.send(audioBuffer);
       } else if (ttsResult instanceof ArrayBuffer) {
         // Direct ArrayBuffer
-        console.log('Sending direct ArrayBuffer, size:', ttsResult.byteLength);
+        console.log("Sending direct ArrayBuffer, size:", ttsResult.byteLength);
         ws.send(ttsResult);
       } else {
         // Try to handle other formats
-        console.log('Unknown TTS result format, attempting conversion');
+        console.log("Unknown TTS result format, attempting conversion");
         try {
           const audioArray = new Uint8Array(ttsResult);
           ws.send(audioArray.buffer);
         } catch (conversionError) {
-          console.error('Failed to convert TTS result:', conversionError);
-          ws.send(JSON.stringify({ type: 'error', message: 'TTS response format not supported: ' + conversionError.message }));
+          console.error("Failed to convert TTS result:", conversionError);
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message:
+                "TTS response format not supported: " + conversionError.message,
+            }),
+          );
           return;
         }
       }
-
     } catch (error) {
-      console.error('Response generation error:', error);
-      ws.send(JSON.stringify({ type: 'error', message: 'Failed to generate response: ' + error.message }));
+      console.error("Response generation error:", error);
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "Failed to generate response: " + error.message,
+        }),
+      );
     }
   }
 
   webSocketClose(ws, code, reason, wasClean) {
-    console.log('WebSocket closed:', code, reason, wasClean);
+    console.log("WebSocket closed:", code, reason, wasClean);
   }
 
   webSocketError(ws, error) {
-    console.error('WebSocket error:', error);
+    console.error("WebSocket error:", error);
   }
 }
 
@@ -961,7 +1126,14 @@ const HTML_CONTENT = `
                 try {
                     // Convert collected audio to format suitable for ASR
                     const audioData = new Float32Array(this.audioBuffer.slice(0, 32000));
-                    const audioBytes = new Uint8Array(audioData.buffer);
+                    
+                    // Convert Float32 to 16-bit PCM
+                    const pcm16 = new Int16Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        pcm16[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32767));
+                    }
+                    
+                    const audioBytes = new Uint8Array(pcm16.buffer);
                     const base64Audio = btoa(String.fromCharCode.apply(null, audioBytes));
                     
                     // Send for ASR processing
@@ -1175,3 +1347,4 @@ const HTML_CONTENT = `
 </body>
 </html>
 `;
+
