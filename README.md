@@ -2,9 +2,9 @@
 
 A realtime voice chatbot built with Cloudflare AI Workers and WebSockets, featuring:
 
-- **ASR (Automatic Speech Recognition)**: `@cf/openai/whisper-tiny-en`
-- **LLM (Large Language Model)**: `@cf/openai/gpt-oss-120b`
-- **TTS (Text-to-Speech)**: `@cf/deepgram/aura-1`
+- **ASR (Automatic Speech Recognition)**: `@cf/openai/whisper-large-v3-turbo`
+- **LLM (Large Language Model)**: `@cf/zai-org/glm-4.7-flash`
+- **TTS (Text-to-Speech)**: `@cf/deepgram/aura-2-en`, `@cf/deepgram/aura-2-es`, and `@cf/myshell-ai/melotts`
 
 ## Features
 
@@ -46,28 +46,28 @@ Cloudflare Worker (WebSocket Handler)
     ↓ Durable Object
 Voice Processing Pipeline:
     1. Audio → ASR (Whisper) → Text
-    2. Text → LLM (GPT) → Response
-    3. Response → TTS (Aura) → Audio
+    2. Text → LLM (GLM) → Response
+    3. Response → Language-aware TTS → Audio
     ↓ WebSocket
 Browser (Audio Playback)
 ```
 
 ### AI Models Used
 
-1. **Whisper Tiny EN** (`@cf/openai/whisper-tiny-en`)
+1. **Whisper Large V3 Turbo** (`@cf/openai/whisper-large-v3-turbo`)
    - Converts spoken audio to text
-   - Optimized for English language
-   - Fast processing for real-time applications
+   - Multilingual speech recognition with better accuracy
+   - Stronger default choice for mixed-language voice input
 
-2. **GPT OSS 120B** (`@cf/openai/gpt-oss-120b`)
+2. **GLM 4.7 Flash** (`@cf/zai-org/glm-4.7-flash`)
    - Generates conversational responses
-   - Large context window for coherent conversations
-   - Instruction-tuned for helpful responses
+   - Optimized for multilingual dialogue and instruction following
+   - Lower latency than larger reasoning-heavy models for voice UX
 
-3. **Deepgram Aura** (`@cf/deepgram/aura-1`)
-   - Converts text responses to natural speech
-   - High-quality voice synthesis
-   - Low latency for real-time conversations
+3. **Aura 2 + MeloTTS**
+   - Uses Aura 2 for natural English and Spanish speech
+   - Falls back to MeloTTS for supported multilingual voices
+   - Keeps voice playback aligned with the detected language
 
 ### WebSocket Message Types
 
@@ -152,17 +152,18 @@ Update the model identifiers in `src/index.js`:
 
 ```javascript
 // ASR Model
-const transcriptionResult = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
-  audio: [...audioBuffer]
+const transcriptionResult = await this.env.AI.run('@cf/openai/whisper-large-v3-turbo', {
+  audio: base64Audio,
+  task: 'transcribe'
 });
 
 // LLM Model  
-const chatResponse = await this.env.AI.run('@cf/openai/gpt-oss-120b', {
+const chatResponse = await this.env.AI.run('@cf/zai-org/glm-4.7-flash', {
   messages: [...]
 });
 
-// TTS Model
-const ttsResult = await this.env.AI.run('@cf/deepgram/aura-1', {
+// TTS Models
+const ttsResult = await this.env.AI.run('@cf/deepgram/aura-2-en', {
   text: responseText
 });
 ```

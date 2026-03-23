@@ -1,3 +1,196 @@
+const MODELS = {
+  TURN_DETECTION: "@cf/pipecat-ai/smart-turn-v2",
+  ASR: "@cf/openai/whisper-large-v3-turbo",
+  CHAT_PRIMARY: "@cf/zai-org/glm-4.7-flash",
+  CHAT_FALLBACK: "@cf/openai/gpt-oss-120b",
+  TTS_EN: "@cf/deepgram/aura-2-en",
+  TTS_ES: "@cf/deepgram/aura-2-es",
+  TTS_MULTILINGUAL: "@cf/myshell-ai/melotts",
+};
+
+const SYSTEM_PROMPT =
+  "You are a helpful AI voice assistant. Reply naturally for spoken audio, keep answers concise, and match the user's language unless they ask to switch languages.";
+
+const MELO_LANGUAGES = ["en", "es", "fr", "ja", "ko", "zh"];
+
+function normalizeLanguageCode(language) {
+  if (!language || typeof language !== "string") {
+    return "en";
+  }
+
+  return language.toLowerCase().split(/[-_]/)[0];
+}
+
+function uint8ArrayToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return btoa(binary);
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === "string") {
+    return content.trim() || null;
+  }
+
+  if (Array.isArray(content)) {
+    const combinedText = content
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+
+        if (!item || typeof item !== "object") {
+          return "";
+        }
+
+        if (typeof item.text === "string") {
+          return item.text;
+        }
+
+        if (typeof item.output_text === "string") {
+          return item.output_text;
+        }
+
+        if (typeof item.content === "string") {
+          return item.content;
+        }
+
+        return "";
+      })
+      .join("")
+      .trim();
+
+    return combinedText || null;
+  }
+
+  if (content && typeof content === "object") {
+    if (typeof content.text === "string") {
+      return content.text.trim() || null;
+    }
+
+    if (typeof content.output_text === "string") {
+      return content.output_text.trim() || null;
+    }
+  }
+
+  return null;
+}
+
+function extractResponseText(chatResponse) {
+  if (!chatResponse) {
+    return null;
+  }
+
+  if (typeof chatResponse === "string") {
+    return chatResponse.trim() || null;
+  }
+
+  if (Array.isArray(chatResponse)) {
+    for (const item of chatResponse) {
+      const text =
+        extractTextFromContent(item?.content) ||
+        extractTextFromContent(item?.message?.content);
+
+      if (text) {
+        return text;
+      }
+    }
+
+    return null;
+  }
+
+  if (typeof chatResponse !== "object") {
+    return null;
+  }
+
+  if (typeof chatResponse.response === "string") {
+    return chatResponse.response.trim() || null;
+  }
+
+  if (typeof chatResponse.output_text === "string") {
+    return chatResponse.output_text.trim() || null;
+  }
+
+  if (typeof chatResponse.output === "string") {
+    return chatResponse.output.trim() || null;
+  }
+
+  if (Array.isArray(chatResponse.choices)) {
+    for (const choice of chatResponse.choices) {
+      const text =
+        extractTextFromContent(choice?.message?.content) ||
+        extractTextFromContent(choice?.delta?.content) ||
+        (typeof choice?.text === "string" ? choice.text.trim() : null);
+
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  if (Array.isArray(chatResponse.output)) {
+    const combinedText = chatResponse.output
+      .map(
+        (item) =>
+          extractTextFromContent(item?.content) ||
+          extractTextFromContent(item?.message?.content) ||
+          "",
+      )
+      .join("")
+      .trim();
+
+    if (combinedText) {
+      return combinedText;
+    }
+  }
+
+  if (chatResponse.result) {
+    return extractResponseText(chatResponse.result);
+  }
+
+  return null;
+}
+
+function selectTtsConfig(language) {
+  const normalizedLanguage = normalizeLanguageCode(language);
+
+  if (normalizedLanguage === "en") {
+    return {
+      model: MODELS.TTS_EN,
+      provider: "aura",
+      language: normalizedLanguage,
+    };
+  }
+
+  if (normalizedLanguage === "es") {
+    return {
+      model: MODELS.TTS_ES,
+      provider: "aura",
+      language: normalizedLanguage,
+    };
+  }
+
+  if (MELO_LANGUAGES.includes(normalizedLanguage)) {
+    return {
+      model: MODELS.TTS_MULTILINGUAL,
+      provider: "melo",
+      language: normalizedLanguage,
+    };
+  }
+
+  return {
+    model: MODELS.TTS_EN,
+    provider: "aura",
+    language: "en",
+  };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -157,7 +350,7 @@ export class WebSocketHibernationServer {
         float32Audio[i] = pcm16Array[i] / 32767.0;
       }
 
-      const turnResult = await this.env.AI.run("@cf/pipecat-ai/smart-turn-v2", {
+      const turnResult = await this.env.AI.run(MODELS.TURN_DETECTION, {
         audio: Array.from(float32Audio),
         dtype: data.dtype || "float32",
       });
@@ -209,22 +402,28 @@ export class WebSocketHibernationServer {
         wavBytes.set(wavHeader, 0);
         wavBytes.set(pcm16Data, wavHeader.byteLength);
 
-        // Per official example, send the raw bytes of the file as an array of numbers
-        const audioArray = [...wavBytes];
+        const audioBase64 = uint8ArrayToBase64(wavBytes);
 
-        console.log("Total WAV bytes sent to AI:", audioArray.length);
+        console.log("Total WAV bytes sent to AI:", wavBytes.length);
 
         const transcriptionResult = await this.env.AI.run(
-          "@cf/openai/whisper-tiny-en",
+          MODELS.ASR,
           {
-            audio: audioArray,
+            audio: audioBase64,
+            task: "transcribe",
+            vad_filter: true,
+            condition_on_previous_text: false,
           },
         );
 
         console.log("Whisper result:", transcriptionResult);
 
         const transcribedText = transcriptionResult.text || "";
+        const detectedLanguage =
+          transcriptionResult.transcription_info?.language || "en";
+
         console.log("Transcribed text:", transcribedText);
+        console.log("Detected language:", detectedLanguage);
 
         if (!transcribedText.trim()) {
           console.log("No speech detected in audio");
@@ -235,7 +434,11 @@ export class WebSocketHibernationServer {
         }
 
         // Process the transcribed text and respond with audio
-        await this.processAndRespondWithAudio(ws, transcribedText);
+        await this.processAndRespondWithAudio(
+          ws,
+          transcribedText,
+          detectedLanguage,
+        );
       } catch (asrError) {
         console.error("ASR (Whisper) error:", asrError);
         ws.send(
@@ -256,163 +459,59 @@ export class WebSocketHibernationServer {
     }
   }
 
-  async processAndRespondWithAudio(ws, inputText) {
+  async processAndRespondWithAudio(ws, inputText, language = "en") {
     try {
-      // LLM: Generate response using GPT OSS 120B
-      let chatResponse;
+      let chatResponse = null;
       try {
-        console.log("Generating response with GPT OSS 120B");
-        chatResponse = await this.env.AI.run("@cf/openai/gpt-oss-120b", {
-          instructions:
-            "You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech. Respond in a friendly, engaging manner suitable for voice interaction.",
-          input: inputText,
+        console.log("Generating response with GLM 4.7 Flash");
+        chatResponse = await this.env.AI.run(MODELS.CHAT_PRIMARY, {
+          messages: [
+            {
+              role: "system",
+              content:
+                SYSTEM_PROMPT +
+                ` The detected user language is ${normalizeLanguageCode(language)}.`,
+            },
+            { role: "user", content: inputText },
+          ],
         });
       } catch (llmError) {
         console.log(
-          "GPT OSS 120B failed, trying Llama fallback:",
+          "GLM 4.7 Flash failed, trying GPT OSS fallback:",
           llmError.message,
         );
-        // Fallback to Llama if GPT OSS fails
         try {
-          chatResponse = await this.env.AI.run(
-            "@cf/meta/llama-3.1-8b-instruct",
-            {
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "You are a helpful AI voice assistant. Keep your responses concise, natural, and conversational for speech.",
-                },
-                { role: "user", content: inputText },
-              ],
-            },
-          );
+          chatResponse = await this.env.AI.run(MODELS.CHAT_FALLBACK, {
+            instructions:
+              SYSTEM_PROMPT +
+              ` The detected user language is ${normalizeLanguageCode(language)}.`,
+            input: inputText,
+          });
         } catch (fallbackError) {
-          console.log("Llama fallback also failed:", fallbackError.message);
-          chatResponse = {
-            response:
-              "I apologize, but I could not generate a response at this time.",
-          };
+          console.log("GPT OSS fallback also failed:", fallbackError.message);
+          throw fallbackError;
         }
       }
 
-      let responseText;
+      const responseText = extractResponseText(chatResponse);
 
-      // Handle the object-based response from Llama
-      if (
-        chatResponse &&
-        typeof chatResponse === "object" &&
-        !Array.isArray(chatResponse) &&
-        (chatResponse.response || chatResponse.output)
-      ) {
-        responseText = chatResponse.response || chatResponse.output;
-      }
-      // Handle the array-based response from models like gpt-oss-120b
-      else if (Array.isArray(chatResponse)) {
-        const assistantMessage = chatResponse.find(
-          (m) => m.role === "assistant",
-        );
-        // Guessing the content structure, as the log was truncated
-        if (
-          assistantMessage &&
-          Array.isArray(assistantMessage.content) &&
-          assistantMessage.content.length > 0 &&
-          assistantMessage.content[0].text
-        ) {
-          responseText = assistantMessage.content[0].text;
-        }
-      }
-
-      // Final fallback
       if (!responseText || typeof responseText !== "string") {
         console.error(
           "Could not extract a valid string response from LLM output:",
           chatResponse,
         );
-        responseText =
-          "I apologize, but I could not generate a response at this time.";
+        throw new Error("LLM returned an unsupported response format");
       }
+
       console.log("Extracted LLM Response:", responseText);
-
-      // TTS: Use Deepgram Aura with returnRawResponse option
-      let ttsResult = null;
-      try {
-        console.log("Using TTS model: @cf/deepgram/aura-1");
-        // Reverting to the documented string format, as the service is unstable.
-        ttsResult = await this.env.AI.run(
-          "@cf/deepgram/aura-1",
-          {
-            text: responseText,
-          },
-          {
-            returnRawResponse: true,
-          },
-        );
-        console.log("TTS success with @cf/deepgram/aura-1");
-      } catch (ttsError) {
-        console.log("TTS failed with @cf/deepgram/aura-1:", ttsError.message);
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "TTS failed: " + ttsError.message,
-          }),
-        );
-        return;
-      }
-
-      // Send the raw response directly
-      console.log(
-        "TTS result type:",
-        typeof ttsResult,
-        "instanceof Response:",
-        ttsResult instanceof Response,
+      ws.send(
+        JSON.stringify({
+          type: "text",
+          text: responseText,
+        }),
       );
 
-      if (ttsResult instanceof Response) {
-        // Log headers to check the content type
-        const contentType = ttsResult.headers.get("Content-Type");
-        console.log("TTS Response Content-Type:", contentType);
-
-        // If it's not an audio type, it might be an error message.
-        if (contentType && !contentType.startsWith("audio/")) {
-          const errorText = await ttsResult.text();
-          console.error("TTS returned non-audio response:", errorText);
-          ws.send(
-            JSON.stringify({
-              type: "error",
-              message: "TTS failed to generate valid audio: " + errorText,
-            }),
-          );
-          return;
-        }
-
-        // If it's a Response object, get the arrayBuffer
-        console.log("Getting arrayBuffer from Response object");
-        const audioBuffer = await ttsResult.arrayBuffer();
-        console.log("Audio buffer size:", audioBuffer.byteLength);
-        ws.send(audioBuffer);
-      } else if (ttsResult instanceof ArrayBuffer) {
-        // Direct ArrayBuffer
-        console.log("Sending direct ArrayBuffer, size:", ttsResult.byteLength);
-        ws.send(ttsResult);
-      } else {
-        // Try to handle other formats
-        console.log("Unknown TTS result format, attempting conversion");
-        try {
-          const audioArray = new Uint8Array(ttsResult);
-          ws.send(audioArray.buffer);
-        } catch (conversionError) {
-          console.error("Failed to convert TTS result:", conversionError);
-          ws.send(
-            JSON.stringify({
-              type: "error",
-              message:
-                "TTS response format not supported: " + conversionError.message,
-            }),
-          );
-          return;
-        }
-      }
+      await this.synthesizeAndSendAudio(ws, responseText, language);
     } catch (error) {
       console.error("Response generation error:", error);
       ws.send(
@@ -422,6 +521,126 @@ export class WebSocketHibernationServer {
         }),
       );
     }
+  }
+
+  async synthesizeAndSendAudio(ws, text, language) {
+    const primaryConfig = selectTtsConfig(language);
+
+    try {
+      console.log(
+        "Using TTS model:",
+        primaryConfig.model,
+        "for language:",
+        primaryConfig.language,
+      );
+      const ttsResult = await this.runTts(text, primaryConfig);
+      await this.sendTtsResult(ws, ttsResult);
+      return;
+    } catch (ttsError) {
+      console.log("Primary TTS failed:", ttsError.message);
+
+      const fallbackLanguage = normalizeLanguageCode(language);
+      if (
+        primaryConfig.provider === "aura" &&
+        MELO_LANGUAGES.includes(fallbackLanguage)
+      ) {
+        const fallbackConfig = {
+          model: MODELS.TTS_MULTILINGUAL,
+          provider: "melo",
+          language: fallbackLanguage,
+        };
+
+        console.log(
+          "Falling back to multilingual TTS:",
+          fallbackConfig.model,
+          "for language:",
+          fallbackConfig.language,
+        );
+        const fallbackResult = await this.runTts(text, fallbackConfig);
+        await this.sendTtsResult(ws, fallbackResult);
+        return;
+      }
+
+      throw ttsError;
+    }
+  }
+
+  async runTts(text, config) {
+    if (config.provider === "aura") {
+      return this.env.AI.run(
+        config.model,
+        {
+          text,
+          encoding: "mp3",
+        },
+        {
+          returnRawResponse: true,
+        },
+      );
+    }
+
+    return this.env.AI.run(config.model, {
+      prompt: text,
+      lang: config.language,
+    });
+  }
+
+  async sendTtsResult(ws, ttsResult) {
+    console.log(
+      "TTS result type:",
+      typeof ttsResult,
+      "instanceof Response:",
+      ttsResult instanceof Response,
+    );
+
+    if (ttsResult instanceof Response) {
+      const contentType = ttsResult.headers.get("Content-Type");
+      console.log("TTS Response Content-Type:", contentType);
+
+      if (contentType && !contentType.startsWith("audio/")) {
+        const errorText = await ttsResult.text();
+        throw new Error("TTS returned non-audio response: " + errorText);
+      }
+
+      const audioBuffer = await ttsResult.arrayBuffer();
+      console.log("Audio buffer size:", audioBuffer.byteLength);
+      ws.send(audioBuffer);
+      return;
+    }
+
+    if (ttsResult instanceof ArrayBuffer) {
+      console.log("Sending direct ArrayBuffer, size:", ttsResult.byteLength);
+      ws.send(ttsResult);
+      return;
+    }
+
+    if (ArrayBuffer.isView(ttsResult)) {
+      const audioBuffer = ttsResult.buffer.slice(
+        ttsResult.byteOffset,
+        ttsResult.byteOffset + ttsResult.byteLength,
+      );
+      console.log("Sending typed array audio, size:", audioBuffer.byteLength);
+      ws.send(audioBuffer);
+      return;
+    }
+
+    if (typeof ttsResult === "string") {
+      ws.send(JSON.stringify({ type: "audio", audio: ttsResult, format: "mp3" }));
+      return;
+    }
+
+    if (ttsResult && typeof ttsResult.audio === "string") {
+      ws.send(
+        JSON.stringify({
+          type: "audio",
+          audio: ttsResult.audio,
+          format: "mp3",
+        }),
+      );
+      return;
+    }
+
+    throw new Error("TTS response format not supported");
   }
 
   webSocketClose(ws, code, reason, wasClean) {
@@ -1189,14 +1408,12 @@ const HTML_CONTENT = `
                 if (data instanceof ArrayBuffer) {
                     console.log('Received binary audio data (ArrayBuffer), size:', data.byteLength);
                     this.playBinaryAudio(data);
-                    this.addMessage('bot', '🔊 [AI Response]');
                     return;
                 } else if (data instanceof Blob) {
                     console.log('Received binary audio data (Blob), size:', data.size);
                     // Convert Blob to ArrayBuffer and play
                     data.arrayBuffer().then(arrayBuffer => {
                         this.playBinaryAudio(arrayBuffer);
-                        this.addMessage('bot', '🔊 [AI Response]');
                     }).catch(error => {
                         console.error('Error converting Blob to ArrayBuffer:', error);
                         this.addMessage('error', 'Failed to process audio blob');
@@ -1213,7 +1430,6 @@ const HTML_CONTENT = `
                         case 'audio':
                             console.log('Received base64 audio');
                             this.playAudio(message.audio);
-                            this.addMessage('bot', '🔊 [AI Response]');
                             break;
                         case 'text':
                             this.addMessage('bot', message.text);
@@ -1347,4 +1563,3 @@ const HTML_CONTENT = `
 </body>
 </html>
 `;
-
