@@ -15,3 +15,10 @@ new_sqlite_classes = ["WebSocketHibernationServer"]
 [ai]
 binding = "AI"
 remote = true
+
+# Set to your AI Gateway name to enable MiniMax TTS for languages Cloudflare
+# can't synthesize first-party (zh/ja/ko). Empty = disabled (browser TTS is used).
+# Requires creating the gateway in the dashboard (AI > AI Gateway) and enabling
+# partner-model billing. See CLAUDE.md.
+[vars]
+AI_GATEWAY_ID = ""
