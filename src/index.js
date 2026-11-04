@@ -1,196 +1,3 @@
-const MODELS = {
-  TURN_DETECTION: "@cf/pipecat-ai/smart-turn-v2",
-  ASR: "@cf/openai/whisper-large-v3-turbo",
-  CHAT_PRIMARY: "@cf/zai-org/glm-4.7-flash",
-  CHAT_FALLBACK: "@cf/openai/gpt-oss-120b",
-  TTS_EN: "@cf/deepgram/aura-2-en",
-  TTS_ES: "@cf/deepgram/aura-2-es",
-  TTS_MULTILINGUAL: "@cf/myshell-ai/melotts",
-};
-
-const SYSTEM_PROMPT =
-  "You are a helpful AI voice assistant. Reply naturally for spoken audio, keep answers concise, and match the user's language unless they ask to switch languages.";
-
-const MELO_LANGUAGES = ["en", "es", "fr", "ja", "ko", "zh"];
-
-function normalizeLanguageCode(language) {
-  if (!language || typeof language !== "string") {
-    return "en";
-  }
-
-  return language.toLowerCase().split(/[-_]/)[0];
-}
-
-function uint8ArrayToBase64(bytes) {
-  let binary = "";
-  const chunkSize = 0x8000;
-
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
-}
-
-function extractTextFromContent(content) {
-  if (typeof content === "string") {
-    return content.trim() || null;
-  }
-
-  if (Array.isArray(content)) {
-    const combinedText = content
-      .map((item) => {
-        if (typeof item === "string") {
-          return item;
-        }
-
-        if (!item || typeof item !== "object") {
-          return "";
-        }
-
-        if (typeof item.text === "string") {
-          return item.text;
-        }
-
-        if (typeof item.output_text === "string") {
-          return item.output_text;
-        }
-
-        if (typeof item.content === "string") {
-          return item.content;
-        }
-
-        return "";
-      })
-      .join("")
-      .trim();
-
-    return combinedText || null;
-  }
-
-  if (content && typeof content === "object") {
-    if (typeof content.text === "string") {
-      return content.text.trim() || null;
-    }
-
-    if (typeof content.output_text === "string") {
-      return content.output_text.trim() || null;
-    }
-  }
-
-  return null;
-}
-
-function extractResponseText(chatResponse) {
-  if (!chatResponse) {
-    return null;
-  }
-
-  if (typeof chatResponse === "string") {
-    return chatResponse.trim() || null;
-  }
-
-  if (Array.isArray(chatResponse)) {
-    for (const item of chatResponse) {
-      const text =
-        extractTextFromContent(item?.content) ||
-        extractTextFromContent(item?.message?.content);
-
-      if (text) {
-        return text;
-      }
-    }
-
-    return null;
-  }
-
-  if (typeof chatResponse !== "object") {
-    return null;
-  }
-
-  if (typeof chatResponse.response === "string") {
-    return chatResponse.response.trim() || null;
-  }
-
-  if (typeof chatResponse.output_text === "string") {
-    return chatResponse.output_text.trim() || null;
-  }
-
-  if (typeof chatResponse.output === "string") {
-    return chatResponse.output.trim() || null;
-  }
-
-  if (Array.isArray(chatResponse.choices)) {
-    for (const choice of chatResponse.choices) {
-      const text =
-        extractTextFromContent(choice?.message?.content) ||
-        extractTextFromContent(choice?.delta?.content) ||
-        (typeof choice?.text === "string" ? choice.text.trim() : null);
-
-      if (text) {
-        return text;
-      }
-    }
-  }
-
-  if (Array.isArray(chatResponse.output)) {
-    const combinedText = chatResponse.output
-      .map(
-        (item) =>
-          extractTextFromContent(item?.content) ||
-          extractTextFromContent(item?.message?.content) ||
-          "",
-      )
-      .join("")
-      .trim();
-
-    if (combinedText) {
-      return combinedText;
-    }
-  }
-
-  if (chatResponse.result) {
-    return extractResponseText(chatResponse.result);
-  }
-
-  return null;
-}
-
-function selectTtsConfig(language) {
-  const normalizedLanguage = normalizeLanguageCode(language);
-
-  if (normalizedLanguage === "en") {
-    return {
-      model: MODELS.TTS_EN,
-      provider: "aura",
-      language: normalizedLanguage,
-    };
-  }
-
-  if (normalizedLanguage === "es") {
-    return {
-      model: MODELS.TTS_ES,
-      provider: "aura",
-      language: normalizedLanguage,
-    };
-  }
-
-  if (MELO_LANGUAGES.includes(normalizedLanguage)) {
-    return {
-      model: MODELS.TTS_MULTILINGUAL,
-      provider: "melo",
-      language: normalizedLanguage,
-    };
-  }
-
-  return {
-    model: MODELS.TTS_EN,
-    provider: "aura",
-    language: "en",
-  };
-}
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -215,6 +22,16 @@ export default {
 
     return new Response("Not found", { status: 404 });
   },
+};
+
+// MiniMax voice IDs per language, used only when an AI Gateway is configured.
+// NOTE: these names must be confirmed against the live model once the gateway is
+// set up (the docs don't publish the enum). Until then MiniMax is disabled and
+// these are inert. en/es never reach MiniMax (they use Aura-2).
+const MINIMAX_VOICES = {
+  zh: "Chinese (Mandarin)_Warm_Girl",
+  ja: "Japanese_CalmLady",
+  ko: "Korean_SweetGirl",
 };
 
 export class WebSocketHibernationServer {
@@ -246,10 +63,12 @@ export class WebSocketHibernationServer {
           await this.handleTurnDetection(ws, data);
           return;
         } else if (data.type === "audio_processing") {
-          // Process complete audio for ASR - convert base64 back to proper audio format
+          const sampleRate = data.sample_rate || 16000;
           console.log(
             "Received audio_processing request, base64 length:",
             data.audio.length,
+            "sample_rate:",
+            sampleRate,
           );
 
           try {
@@ -265,8 +84,7 @@ export class WebSocketHibernationServer {
               pcm16Bytes.length,
             );
 
-            // Pass the raw PCM bytes to the handler, which will add the WAV header
-            await this.handleAudioInput(ws, pcm16Bytes);
+            await this.handleAudioInput(ws, pcm16Bytes, sampleRate);
             return;
           } catch (decodeError) {
             console.error("Audio decode error:", decodeError);
@@ -334,6 +152,93 @@ export class WebSocketHibernationServer {
     return new Uint8Array(buffer);
   }
 
+  // MeloTTS supports en/es/fr/zh/ja/ko. We can only reliably distinguish
+  // CJK scripts from Latin via Unicode blocks; for Latin text we default
+  // to English, which is acceptable since the LLM replies in the user's
+  // language and en-voice MeloTTS will still pronounce most Latin text.
+  detectLangFromText(text) {
+    if (!text) return "en";
+    if (/[가-힯]/.test(text)) return "ko";
+    if (/[぀-ゟ゠-ヿ]/.test(text)) return "ja";
+    if (/[一-鿿]/.test(text)) return "zh";
+    return "en";
+  }
+
+  // Workers AI returns assistant text in different shapes depending on the
+  // model. gpt-oss exposes a normalized `response` string; OpenAI-compatible
+  // chat models use choices[0].message.content; the Responses API nests it
+  // under output[].content[].text. Try them in order.
+  extractLLMText(r) {
+    if (!r) return "";
+    if (typeof r.response === "string" && r.response.trim()) return r.response;
+    const chat = r.choices?.[0]?.message?.content;
+    if (typeof chat === "string" && chat.trim()) return chat;
+    if (Array.isArray(r.output)) {
+      for (const item of r.output) {
+        const parts = item?.content;
+        if (Array.isArray(parts)) {
+          for (const p of parts) {
+            if (typeof p?.text === "string" && p.text.trim()) return p.text;
+          }
+        }
+      }
+    }
+    return "";
+  }
+
+  // TTS router. Returns raw audio bytes to stream to the client, or `null` to
+  // signal the caller that no server-side voice exists for this language and the
+  // browser should speak the text itself.
+  //
+  //   en/es     -> Deepgram Aura-2 (high quality, no extra setup)
+  //   otherwise -> MiniMax via AI Gateway *if configured*, else browser TTS.
+  //                (Cloudflare's MeloTTS produces gibberish for Chinese and
+  //                Aura-2 only speaks en/es, so there is no first-party zh/ja/ko TTS.)
+  async synthesizeSpeech(text, detectedLang) {
+    const AURA_LANGS = {
+      en: "@cf/deepgram/aura-2-en",
+      es: "@cf/deepgram/aura-2-es",
+    };
+    const auraModel = AURA_LANGS[detectedLang];
+
+    if (auraModel) {
+      console.log("Using TTS model:", auraModel);
+      // Aura returns a ReadableStream (or a Response wrapping one) of MP3 audio.
+      const out = await this.env.AI.run(auraModel, { text });
+      const resp = out instanceof Response ? out : new Response(out);
+      const buf = await resp.arrayBuffer();
+      return new Uint8Array(buf);
+    }
+
+    // MiniMax (partner model) — only used once an AI Gateway is configured AND a
+    // voice is known for this language. Needs `AI_GATEWAY_ID` in wrangler.toml and
+    // partner-model billing enabled. On any failure we fall through to browser TTS
+    // so the user is never left without speech.
+    const gatewayId = this.env.AI_GATEWAY_ID;
+    const voiceId = MINIMAX_VOICES[detectedLang];
+    if (gatewayId && voiceId) {
+      try {
+        console.log("Using MiniMax TTS via gateway, voice:", voiceId);
+        const out = await this.env.AI.run(
+          "minimax/speech-2.8-hd",
+          { text, voice_id: voiceId, format: "mp3" },
+          { gateway: { id: gatewayId } },
+        );
+        const audioUrl = out?.audio ?? out?.result?.audio;
+        if (typeof audioUrl === "string" && audioUrl.startsWith("http")) {
+          const a = await fetch(audioUrl);
+          return new Uint8Array(await a.arrayBuffer());
+        }
+        console.error("MiniMax returned no audio URL:", out);
+      } catch (e) {
+        console.log("MiniMax TTS failed, using browser TTS:", e.message);
+      }
+    }
+
+    // No server-side voice for this language — let the browser speak it.
+    return null;
+  }
+
   async handleTurnDetection(ws, data) {
     try {
       console.log("Processing turn detection request");
@@ -350,7 +255,7 @@ export class WebSocketHibernationServer {
         float32Audio[i] = pcm16Array[i] / 32767.0;
       }
 
-      const turnResult = await this.env.AI.run(MODELS.TURN_DETECTION, {
+      const turnResult = await this.env.AI.run("@cf/pipecat-ai/smart-turn-v2", {
         audio: Array.from(float32Audio),
         dtype: data.dtype || "float32",
       });
@@ -375,24 +280,29 @@ export class WebSocketHibernationServer {
     }
   }
 
-  async handleAudioInput(ws, pcm16Data) {
+  async handleAudioInput(ws, pcm16Data, sampleRate) {
     try {
       // Send processing status (optional - could remove for pure audio stream)
       ws.send(JSON.stringify({ type: "status", message: "Processing..." }));
 
+      const rate = sampleRate || 16000;
       console.log(
         "Processing audio input, 16-bit PCM buffer size:",
         pcm16Data.byteLength,
+        "sample_rate:",
+        rate,
       );
 
-      // ASR: Convert speech to text using Whisper
+      // ASR: Whisper Large v3 Turbo — strong multilingual auto-detection,
+      // including Chinese/Japanese/Korean. Chosen over Deepgram Nova-3, which
+      // mis-handled Chinese audio (transcribed it as English).
       try {
-        console.log("Running Whisper ASR...");
+        console.log("Running Whisper ASR (multilingual)...");
 
-        // Create a WAV file in memory to send to Whisper
+        // Create a WAV file using the actual capture rate, not a hardcoded value.
         const wavHeader = this.createWavHeader(
           pcm16Data.byteLength,
-          16000,
+          rate,
           1,
           16,
         );
@@ -402,28 +312,55 @@ export class WebSocketHibernationServer {
         wavBytes.set(wavHeader, 0);
         wavBytes.set(pcm16Data, wavHeader.byteLength);
 
-        const audioBase64 = uint8ArrayToBase64(wavBytes);
+        // whisper-large-v3-turbo expects base64-encoded audio. Chunked encoding
+        // avoids a stack overflow on large buffers.
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let i = 0; i < wavBytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(
+            null,
+            wavBytes.subarray(i, i + chunkSize),
+          );
+        }
+        const audioBase64 = btoa(binary);
 
-        console.log("Total WAV bytes sent to AI:", wavBytes.length);
+        console.log("Total WAV bytes sent to ASR:", wavBytes.length);
 
+        // Omit `language` to enable auto-detection across all supported languages.
         const transcriptionResult = await this.env.AI.run(
-          MODELS.ASR,
+          "@cf/openai/whisper-large-v3-turbo",
           {
             audio: audioBase64,
-            task: "transcribe",
-            vad_filter: true,
-            condition_on_previous_text: false,
           },
         );
 
-        console.log("Whisper result:", transcriptionResult);
+        console.log("Whisper result:", JSON.stringify(transcriptionResult));
 
-        const transcribedText = transcriptionResult.text || "";
-        const detectedLanguage =
-          transcriptionResult.transcription_info?.language || "en";
+        const transcribedText = (transcriptionResult?.text || "").trim();
 
-        console.log("Transcribed text:", transcribedText);
-        console.log("Detected language:", detectedLanguage);
+        // Language for TTS routing. The transcribed script is the most reliable
+        // signal for CJK (Aura can't speak those, so they must route to MeloTTS);
+        // otherwise trust Whisper's detected language (it may report a full name
+        // like "english", so map the common ones to ISO codes).
+        const scriptLang = this.detectLangFromText(transcribedText);
+        let detectedLang;
+        if (scriptLang !== "en") {
+          detectedLang = scriptLang;
+        } else {
+          const NAME_TO_CODE = {
+            english: "en",
+            spanish: "es",
+            french: "fr",
+            german: "de",
+            chinese: "zh",
+            japanese: "ja",
+            korean: "ko",
+          };
+          let rawLang = String(transcriptionResult?.language || "en").toLowerCase();
+          rawLang = NAME_TO_CODE[rawLang] || rawLang;
+          detectedLang = rawLang.split("-")[0];
+        }
+        console.log("Transcribed text:", transcribedText, "lang:", detectedLang);
 
         if (!transcribedText.trim()) {
           console.log("No speech detected in audio");
@@ -433,12 +370,17 @@ export class WebSocketHibernationServer {
           return;
         }
 
-        // Process the transcribed text and respond with audio
-        await this.processAndRespondWithAudio(
-          ws,
-          transcribedText,
-          detectedLanguage,
+        // Surface the transcription to the client for debugging.
+        ws.send(
+          JSON.stringify({
+            type: "transcript",
+            text: transcribedText,
+            lang: detectedLang,
+          }),
         );
+
+        // Process the transcribed text and respond with audio
+        await this.processAndRespondWithAudio(ws, transcribedText, detectedLang);
       } catch (asrError) {
         console.error("ASR (Whisper) error:", asrError);
         ws.send(
@@ -459,59 +401,98 @@ export class WebSocketHibernationServer {
     }
   }
 
-  async processAndRespondWithAudio(ws, inputText, language = "en") {
+  async processAndRespondWithAudio(ws, inputText, detectedLang) {
     try {
-      let chatResponse = null;
+      const messages = [
+        {
+          role: "system",
+          content:
+            "You are a helpful multilingual AI voice assistant. Always reply in the same language the user spoke. Keep your responses concise, natural, and conversational for speech.",
+        },
+        { role: "user", content: inputText },
+      ];
+
+      // LLM: gpt-oss-120b — newest open model in the Workers AI catalog.
+      // Voice replies need to be short, so cap max_tokens. GLM-4.7-Flash
+      // (fast, dialogue-tuned) stays as the fallback.
+      const llmParams = {
+        messages,
+        max_tokens: 200,
+        temperature: 0.6,
+      };
+
+      let chatResponse;
       try {
-        console.log("Generating response with GLM 4.7 Flash");
-        chatResponse = await this.env.AI.run(MODELS.CHAT_PRIMARY, {
-          messages: [
-            {
-              role: "system",
-              content:
-                SYSTEM_PROMPT +
-                ` The detected user language is ${normalizeLanguageCode(language)}.`,
-            },
-            { role: "user", content: inputText },
-          ],
-        });
+        console.log("Generating response with gpt-oss-120b");
+        chatResponse = await this.env.AI.run(
+          "@cf/openai/gpt-oss-120b",
+          llmParams,
+        );
       } catch (llmError) {
         console.log(
-          "GLM 4.7 Flash failed, trying GPT OSS fallback:",
+          "gpt-oss-120b failed, trying GLM-4.7-Flash fallback:",
           llmError.message,
         );
         try {
-          chatResponse = await this.env.AI.run(MODELS.CHAT_FALLBACK, {
-            instructions:
-              SYSTEM_PROMPT +
-              ` The detected user language is ${normalizeLanguageCode(language)}.`,
-            input: inputText,
-          });
+          chatResponse = await this.env.AI.run(
+            "@cf/zai-org/glm-4.7-flash",
+            llmParams,
+          );
         } catch (fallbackError) {
-          console.log("GPT OSS fallback also failed:", fallbackError.message);
-          throw fallbackError;
+          console.log("GLM-4.7 fallback also failed:", fallbackError.message);
+          chatResponse = null;
         }
       }
 
-      const responseText = extractResponseText(chatResponse);
+      let responseText =
+        this.extractLLMText(chatResponse) ||
+        "I apologize, but I could not generate a response at this time.";
 
-      if (!responseText || typeof responseText !== "string") {
+      // If reasoning leaks through as <think>...</think>, drop it before TTS.
+      responseText = responseText.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
+      if (!this.extractLLMText(chatResponse)) {
         console.error(
           "Could not extract a valid string response from LLM output:",
           chatResponse,
         );
-        throw new Error("LLM returned an unsupported response format");
       }
-
       console.log("Extracted LLM Response:", responseText);
+
+      // Surface the LLM reply to the client for debugging.
       ws.send(
         JSON.stringify({
-          type: "text",
+          type: "response_text",
           text: responseText,
         }),
       );
 
-      await this.synthesizeAndSendAudio(ws, responseText, language);
+      // TTS routing (see synthesizeSpeech): en/es get server audio from Aura-2;
+      // other languages either use MiniMax (if a gateway is configured) or fall
+      // back to having the browser speak the text via speechSynthesis.
+      console.log("TTS for detected language:", detectedLang);
+      let audioBytes;
+      try {
+        audioBytes = await this.synthesizeSpeech(responseText, detectedLang);
+      } catch (ttsError) {
+        console.log("TTS failed:", ttsError.message);
+        audioBytes = null;
+      }
+
+      if (audioBytes && audioBytes.byteLength > 0) {
+        console.log("Sending TTS audio, size:", audioBytes.byteLength);
+        ws.send(audioBytes.buffer);
+      } else {
+        // No server-side voice — tell the client to speak it locally.
+        console.log("No server audio; asking browser to speak. lang:", detectedLang);
+        ws.send(
+          JSON.stringify({
+            type: "speak_text",
+            text: responseText,
+            lang: detectedLang,
+          }),
+        );
+      }
     } catch (error) {
       console.error("Response generation error:", error);
       ws.send(
@@ -521,126 +502,6 @@ export class WebSocketHibernationServer {
         }),
       );
     }
-  }
-
-  async synthesizeAndSendAudio(ws, text, language) {
-    const primaryConfig = selectTtsConfig(language);
-
-    try {
-      console.log(
-        "Using TTS model:",
-        primaryConfig.model,
-        "for language:",
-        primaryConfig.language,
-      );
-      const ttsResult = await this.runTts(text, primaryConfig);
-      await this.sendTtsResult(ws, ttsResult);
-      return;
-    } catch (ttsError) {
-      console.log("Primary TTS failed:", ttsError.message);
-
-      const fallbackLanguage = normalizeLanguageCode(language);
-      if (
-        primaryConfig.provider === "aura" &&
-        MELO_LANGUAGES.includes(fallbackLanguage)
-      ) {
-        const fallbackConfig = {
-          model: MODELS.TTS_MULTILINGUAL,
-          provider: "melo",
-          language: fallbackLanguage,
-        };
-
-        console.log(
-          "Falling back to multilingual TTS:",
-          fallbackConfig.model,
-          "for language:",
-          fallbackConfig.language,
-        );
-        const fallbackResult = await this.runTts(text, fallbackConfig);
-        await this.sendTtsResult(ws, fallbackResult);
-        return;
-      }
-
-      throw ttsError;
-    }
-  }
-
-  async runTts(text, config) {
-    if (config.provider === "aura") {
-      return this.env.AI.run(
-        config.model,
-        {
-          text,
-          encoding: "mp3",
-        },
-        {
-          returnRawResponse: true,
-        },
-      );
-    }
-
-    return this.env.AI.run(config.model, {
-      prompt: text,
-      lang: config.language,
-    });
-  }
-
-  async sendTtsResult(ws, ttsResult) {
-    console.log(
-      "TTS result type:",
-      typeof ttsResult,
-      "instanceof Response:",
-      ttsResult instanceof Response,
-    );
-
-    if (ttsResult instanceof Response) {
-      const contentType = ttsResult.headers.get("Content-Type");
-      console.log("TTS Response Content-Type:", contentType);
-
-      if (contentType && !contentType.startsWith("audio/")) {
-        const errorText = await ttsResult.text();
-        throw new Error("TTS returned non-audio response: " + errorText);
-      }
-
-      const audioBuffer = await ttsResult.arrayBuffer();
-      console.log("Audio buffer size:", audioBuffer.byteLength);
-      ws.send(audioBuffer);
-      return;
-    }
-
-    if (ttsResult instanceof ArrayBuffer) {
-      console.log("Sending direct ArrayBuffer, size:", ttsResult.byteLength);
-      ws.send(ttsResult);
-      return;
-    }
-
-    if (ArrayBuffer.isView(ttsResult)) {
-      const audioBuffer = ttsResult.buffer.slice(
-        ttsResult.byteOffset,
-        ttsResult.byteOffset + ttsResult.byteLength,
-      );
-      console.log("Sending typed array audio, size:", audioBuffer.byteLength);
-      ws.send(audioBuffer);
-      return;
-    }
-
-    if (typeof ttsResult === "string") {
-      ws.send(JSON.stringify({ type: "audio", audio: ttsResult, format: "mp3" }));
-      return;
-    }
-
-    if (ttsResult && typeof ttsResult.audio === "string") {
-      ws.send(
-        JSON.stringify({
-          type: "audio",
-          audio: ttsResult.audio,
-          format: "mp3",
-        }),
-      );
-      return;
-    }
-
-    throw new Error("TTS response format not supported");
   }
 
   webSocketClose(ws, code, reason, wasClean) {
@@ -812,10 +673,9 @@ const HTML_CONTENT = `
         <div id="chatArea" class="chat-area"></div>
         
         <div class="controls">
-            <button id="toggleBtn" class="record-btn">🎤 Start Listening</button>
-            <button id="testBtn" class="record-btn" style="background-color: #6c757d;">🎯 Process Audio</button>
+            <button id="startBtn" class="record-btn">🎙️ Start Conversation</button>
             <div class="status-indicator">
-                <span id="listeningStatus">Ready to listen</span>
+                <span id="listeningStatus">Press start, then just talk — I'll reply, and you can interrupt me anytime.</span>
             </div>
         </div>
         
@@ -838,6 +698,10 @@ const HTML_CONTENT = `
                 this.volume = 0.8;
                 this.processorNode = null;
                 this.isProcessingTurn = false;
+                this.botSpeaking = false;     // true while the bot's reply is playing
+                this.currentSource = null;    // the AudioBufferSourceNode now playing
+                this.currentUtterance = null; // the SpeechSynthesisUtterance now speaking
+                this.bargeInChunks = 0;       // consecutive loud chunks during playback
                 this.silenceTimeout = null;
                 this.audioBuffer = [];
                 this.turnDetectionThreshold = 0.7; // Probability threshold for turn completion
@@ -852,8 +716,7 @@ const HTML_CONTENT = `
 
             initializeElements() {
                 this.chatArea = document.getElementById('chatArea');
-                this.toggleBtn = document.getElementById('toggleBtn');
-                this.testBtn = document.getElementById('testBtn');
+                this.startBtn = document.getElementById('startBtn');
                 this.listeningStatus = document.getElementById('listeningStatus');
                 this.volumeSlider = document.getElementById('volumeSlider');
                 this.volumeValue = document.getElementById('volumeValue');
@@ -871,7 +734,7 @@ const HTML_CONTENT = `
                 
                 this.ws.onopen = () => {
                     this.updateConnectionStatus('connected', 'Connected');
-                    this.addMessage('system', 'Connected! Click "Start Listening" then "Process Audio" to chat.');
+                    this.addMessage('system', 'Connected! Click "Start Listening" and just talk — I will respond when you stop.');
                 };
                 
                 this.ws.onmessage = (event) => {
@@ -890,96 +753,11 @@ const HTML_CONTENT = `
             }
 
             initializeEventListeners() {
-                this.toggleBtn.addEventListener('click', () => this.toggleListening());
-                this.testBtn.addEventListener('click', () => this.testProcessAudio());
+                this.startBtn.addEventListener('click', () => this.startConversation());
                 this.volumeSlider.addEventListener('input', (e) => {
                     this.volume = parseFloat(e.target.value);
                     this.volumeValue.textContent = Math.round(this.volume * 100) + '%';
                 });
-            }
-
-            async testProcessAudio() {
-                if (this.audioBuffer.length === 0) {
-                    this.addMessage('error', 'No audio data to process. Start listening first.');
-                    return;
-                }
-                
-                this.addMessage('system', 'Processing ' + this.audioBuffer.length + ' audio samples directly...');
-                
-                try {
-                    // Process audio directly without turn detection
-                    const maxSamples = Math.min(16000, this.audioBuffer.length);
-                    const audioData = new Float32Array(this.audioBuffer.slice(0, maxSamples));
-                    
-                    console.log('Audio data sample:', audioData.slice(0, 10));
-                    
-                    // Check if audio contains actual sound (not just silence)
-                    const audioLevel = this.calculateAudioLevel(audioData);
-                    console.log('Audio level (RMS):', audioLevel);
-                    
-                    if (audioLevel < 0.001) {
-                        this.addMessage('error', 'Audio level too low (' + audioLevel.toFixed(6) + '). Please speak louder or check microphone.');
-                        return;
-                    }
-                    
-                    // Convert Float32 PCM to 16-bit PCM for better compatibility
-                    const pcm16 = new Int16Array(audioData.length);
-                    for (let i = 0; i < audioData.length; i++) {
-                        // Clamp and convert to 16-bit signed integer
-                        pcm16[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32767));
-                    }
-                    
-                    // Convert to bytes properly
-                    const audioBytes = new Uint8Array(pcm16.buffer);
-                    
-                    console.log('Audio bytes length:', audioBytes.length);
-                    console.log('First 16 bytes:', Array.from(audioBytes.slice(0, 16)));
-                    
-                    // Check if we have non-zero audio data
-                    const nonZeroBytes = audioBytes.filter(b => b !== 0).length;
-                    console.log('Non-zero bytes:', nonZeroBytes, '/', audioBytes.length);
-                    
-                    if (nonZeroBytes < audioBytes.length * 0.1) {
-                        this.addMessage('error', 'Audio contains mostly silence. Please speak during recording.');
-                        return;
-                    }
-                    
-                    // Use modern approach with FileReader for reliable base64 conversion
-                    const base64Audio = await new Promise((resolve, reject) => {
-                        const blob = new Blob([audioBytes]);
-                        const reader = new FileReader();
-                        reader.onload = () => {
-                            const dataUrl = reader.result;
-                            // Remove data:application/octet-stream;base64, prefix
-                            const base64 = dataUrl.split(',')[1];
-                            resolve(base64);
-                        };
-                        reader.onerror = reject;
-                        reader.readAsDataURL(blob);
-                    });
-                    
-                    console.log('Base64 audio length:', base64Audio.length);
-                    console.log('Base64 sample (first 100 chars):', base64Audio.substring(0, 100));
-                    
-                    // Validate base64 before sending
-                    try {
-                        const decoded = atob(base64Audio);
-                        console.log('Base64 validation passed, decoded length:', decoded.length);
-                    } catch (validateError) {
-                        throw new Error('Generated invalid base64: ' + validateError.message);
-                    }
-                    
-                    // Send for ASR processing
-                    this.sendAudioForProcessing(base64Audio);
-                    this.addMessage('system', 'Audio sent for processing (level: ' + audioLevel.toFixed(4) + ')...');
-                    
-                    // Clear processed samples
-                    this.audioBuffer = this.audioBuffer.slice(maxSamples);
-                    
-                } catch (error) {
-                    console.error('Processing error:', error);
-                    this.addMessage('error', 'Test processing failed: ' + error.message);
-                }
             }
 
             calculateAudioLevel(audioData) {
@@ -996,20 +774,37 @@ const HTML_CONTENT = `
                 this.connectionStatus.textContent = text;
             }
 
-            async toggleListening() {
+            async startConversation() {
+                // One-time gesture: browsers require a user click before they
+                // grant the mic and allow audio playback. After this it's fully
+                // hands-free — no record button, just talk.
+                this.startBtn.disabled = true;
+                await this.startListening();
                 if (this.isListening) {
-                    this.stopListening();
+                    this.startBtn.style.display = 'none';
                 } else {
-                    await this.startListening();
+                    this.startBtn.disabled = false;
                 }
             }
 
             async startListening() {
                 try {
-                    // Initialize AudioContext on user interaction
+                    // Initialize AudioContext on user interaction.
+                    // Force 16 kHz so the captured samples match what Whisper expects.
+                    // Without this option, the context runs at the system default
+                    // (usually 44.1/48 kHz) and our WAV header would mislabel the rate.
                     if (!this.audioContext) {
-                        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                        console.log('Created AudioContext for real-time processing');
+                        const Ctor = window.AudioContext || window.webkitAudioContext;
+                        try {
+                            this.audioContext = new Ctor({ sampleRate: 16000 });
+                        } catch (e) {
+                            console.warn('AudioContext sampleRate option not supported, using default:', e.message);
+                            this.audioContext = new Ctor();
+                        }
+                        console.log('AudioContext sample rate:', this.audioContext.sampleRate);
+                        if (this.audioContext.sampleRate !== 16000) {
+                            console.warn('AudioContext is running at', this.audioContext.sampleRate, 'Hz — server will be told the real rate.');
+                        }
                     }
                     
                     if (this.audioContext.state === 'suspended') {
@@ -1043,7 +838,7 @@ const HTML_CONTENT = `
                                 
                                 this.processorNode = new AudioWorkletNode(this.audioContext, workletInfo.processorName);
                                 this.processorNode.port.onmessage = (event) => {
-                                    if (this.isListening && !this.isProcessingTurn) {
+                                    if (this.isListening) {
                                         this.processAudioData(event.data.audioData);
                                     }
                                 };
@@ -1060,7 +855,7 @@ const HTML_CONTENT = `
                         // Fallback to ScriptProcessorNode
                         this.processorNode = this.audioContext.createScriptProcessor(4096, 1, 1);
                         this.processorNode.onaudioprocess = (event) => {
-                            if (this.isListening && !this.isProcessingTurn) {
+                            if (this.isListening) {
                                 this.processAudioChunk(event.inputBuffer);
                             }
                         };
@@ -1071,16 +866,18 @@ const HTML_CONTENT = `
                     
                     this.isListening = true;
                     this.isProcessingTurn = false;
+                    this.botSpeaking = false;
+                    this.bargeInChunks = 0;
                     this.pendingTurnDetection = false;
                     this.audioBuffer = [];
                     this.lastTurnDetectionTime = 0;
+                    this.vadState = 'idle';
+                    this.silenceMs = 0;
                     this.updateListeningStatus('🎧 Listening...', 'listening');
-                    this.toggleBtn.textContent = '🛑 Stop Listening';
-                    this.toggleBtn.classList.add('recording');
-                    
+
                 } catch (error) {
                     console.error('Error starting real-time listening:', error);
-                    this.addMessage('error', 'Could not access microphone for real-time listening.');
+                    this.addMessage('error', 'Could not access microphone. Please allow mic access and try again.');
                 }
             }
 
@@ -1128,45 +925,207 @@ const HTML_CONTENT = `
             }
 
             processAudioData(audioData) {
-                // Store audio data for later processing
+                // VAD state machine. AudioWorklet posts 4096 samples at 16kHz
+                // = ~256ms per call. We measure RMS per chunk and decide:
+                //   idle              -> wait for speech onset, keep tiny pre-roll
+                //   speaking          -> buffer everything, watch for silence
+                //   trailing_silence  -> keep buffering; commit after enough quiet
+                const SPEECH_RMS = 0.015;       // above this = speech
+                const SILENCE_RMS = 0.008;      // below this = silence
+                const SILENCE_HOLD_MS = 900;    // quiet this long → end of turn
+                const BARGE_IN_RMS = 0.03;      // louder bar so the bot's own echo won't trip it
+                const BARGE_IN_CHUNKS = 2;      // ~0.5s of sustained speech confirms an interrupt
+                const sr = this.audioContext.sampleRate;
+                const PREROLL_SAMPLES = Math.round(0.25 * sr);   // ~250ms before onset
+                const MAX_UTTERANCE_SAMPLES = Math.round(30 * sr); // cap at 30s
+                const MIN_UTTERANCE_SAMPLES = Math.round(0.5 * sr); // ~500ms; below = ignore
+
+                const level = this.calculateAudioLevel(audioData);
+                const chunkMs = (audioData.length / sr) * 1000;
+
+                // Barge-in: the user starts talking while the bot is speaking.
+                // Echo cancellation removes most of the bot's own voice from the
+                // mic, but we still require a couple of loud chunks before cutting
+                // playback off, to avoid false triggers.
+                if (this.botSpeaking) {
+                    if (level >= BARGE_IN_RMS) {
+                        this.bargeInChunks++;
+                    } else {
+                        this.bargeInChunks = 0;
+                    }
+                    if (this.bargeInChunks < BARGE_IN_CHUNKS) {
+                        return; // not confirmed yet — keep letting the bot talk
+                    }
+                    this.handleBargeIn(); // stops playback, vadState -> 'speaking'
+                }
+
+                // After committing, while we wait on the server, ignore the mic.
+                if (this.isProcessingTurn && !this.botSpeaking) {
+                    return;
+                }
+
                 this.audioBuffer.push(...audioData);
-                
-                // TEMPORARILY DISABLE automatic turn detection to prevent stack overflow
-                // Keep manual testing available via the Test button
-                /*
-                // Re-enable turn detection with proper throttling
-                const now = Date.now();
-                const hasEnoughData = this.audioBuffer.length >= 32000;
-                const isNotBusy = !this.isProcessingTurn && !this.pendingTurnDetection;
-                const hasWaitedEnough = (now - this.lastTurnDetectionTime) >= this.turnDetectionInterval;
-                
-                if (hasEnoughData && isNotBusy && hasWaitedEnough) {
-                    // Immediately set flags to prevent any other calls
-                    this.pendingTurnDetection = true;
-                    this.lastTurnDetectionTime = now;
-                    
-                    console.log('Scheduling turn detection check...');
-                    
-                    // Use a longer delay and ensure proper async handling
-                    setTimeout(() => {
-                        this.performTurnDetection();
-                    }, 200); // Increased delay to prevent rapid firing
+                if (!this.vadState) this.vadState = 'idle';
+
+                if (this.vadState === 'idle') {
+                    if (level >= SPEECH_RMS) {
+                        this.vadState = 'speaking';
+                        this.silenceMs = 0;
+                        this.updateListeningStatus('🗣️ Speaking...', 'listening');
+                    } else if (this.audioBuffer.length > PREROLL_SAMPLES) {
+                        // discard old silence so we don't ship a 10-minute prefix
+                        this.audioBuffer = this.audioBuffer.slice(-PREROLL_SAMPLES);
+                    }
+                } else if (this.vadState === 'speaking') {
+                    if (level < SILENCE_RMS) {
+                        this.vadState = 'trailing_silence';
+                        this.silenceMs = chunkMs;
+                    }
+                    if (this.audioBuffer.length >= MAX_UTTERANCE_SAMPLES) {
+                        // safety: force-commit a runaway utterance
+                        this.commitUtterance();
+                    }
+                } else if (this.vadState === 'trailing_silence') {
+                    if (level >= SPEECH_RMS) {
+                        this.vadState = 'speaking';
+                        this.silenceMs = 0;
+                        this.updateListeningStatus('🗣️ Speaking...', 'listening');
+                    } else {
+                        this.silenceMs += chunkMs;
+                        if (this.silenceMs >= SILENCE_HOLD_MS) {
+                            if (this.audioBuffer.length >= MIN_UTTERANCE_SAMPLES) {
+                                this.commitUtterance();
+                            } else {
+                                // too short to be real speech — drop it
+                                this.audioBuffer = [];
+                                this.vadState = 'idle';
+                                this.silenceMs = 0;
+                            }
+                        }
+                    }
                 }
-                */
-                
-                // Log audio processing periodically with level check
-                if (this.audioBuffer.length % 16000 === 0) {
-                    // Calculate current audio level for debugging
-                    const recentAudio = new Float32Array(this.audioBuffer.slice(-4000)); // Last 4000 samples
-                    const level = this.calculateAudioLevel(recentAudio);
-                    console.log('Audio buffer size:', this.audioBuffer.length, '- Recent level:', level.toFixed(6), '- Use Process button to manually process');
+            }
+
+            async commitUtterance() {
+                const samples = this.audioBuffer;
+                this.audioBuffer = [];
+                this.vadState = 'idle';
+                this.silenceMs = 0;
+                this.isProcessingTurn = true;
+                this.updateListeningStatus('🤔 Thinking...', 'processing');
+
+                try {
+                    const audioData = new Float32Array(samples);
+                    const pcm16 = new Int16Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        pcm16[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32767));
+                    }
+                    const audioBytes = new Uint8Array(pcm16.buffer);
+
+                    const base64Audio = await new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result.split(',')[1]);
+                        reader.onerror = reject;
+                        reader.readAsDataURL(new Blob([audioBytes]));
+                    });
+
+                    this.sendAudioForProcessing(base64Audio, this.audioContext.sampleRate);
+                } catch (error) {
+                    console.error('Commit utterance error:', error);
+                    this.addMessage('error', 'Failed to send speech: ' + error.message);
+                    this.isProcessingTurn = false;
+                    if (this.isListening) {
+                        this.updateListeningStatus('🎧 Listening...', 'listening');
+                    }
                 }
-                
-                // Limit buffer size to prevent memory issues
-                if (this.audioBuffer.length > 96000) {
-                    this.audioBuffer = this.audioBuffer.slice(-64000);
-                    console.log('Audio buffer trimmed to prevent memory issues');
+            }
+
+            handleBargeIn() {
+                console.log('Barge-in detected — interrupting bot playback');
+                this.stopPlayback();
+                this.botSpeaking = false;
+                this.isProcessingTurn = false;
+                this.bargeInChunks = 0;
+                // The user is already mid-sentence, so start capturing immediately.
+                this.audioBuffer = [];
+                this.vadState = 'speaking';
+                this.silenceMs = 0;
+                this.updateListeningStatus('🗣️ Speaking...', 'listening');
+            }
+
+            stopPlayback() {
+                if (this.currentSource) {
+                    try {
+                        this.currentSource.onended = null;
+                        this.currentSource.stop();
+                    } catch (e) {
+                        // already stopped
+                    }
+                    this.currentSource = null;
                 }
+                if (this.currentUtterance) {
+                    this.currentUtterance.onend = null;
+                    this.currentUtterance.onerror = null;
+                    this.currentUtterance = null;
+                }
+                try {
+                    if (window.speechSynthesis) window.speechSynthesis.cancel();
+                } catch (e) {
+                    // ignore
+                }
+            }
+
+            speakWithBrowser(text, lang) {
+                const handBack = () => {
+                    this.botSpeaking = false;
+                    this.isProcessingTurn = false;
+                    this.vadState = 'idle';
+                    this.silenceMs = 0;
+                    this.audioBuffer = [];
+                    if (this.isListening) {
+                        this.updateListeningStatus('🎧 Listening...', 'listening');
+                    }
+                };
+
+                if (!('speechSynthesis' in window) || !text) {
+                    console.warn('speechSynthesis unavailable; cannot speak', lang);
+                    this.addMessage('status', 'No voice available for this language on your device.');
+                    handBack();
+                    return;
+                }
+
+                const BCP47 = { zh: 'zh-CN', ja: 'ja-JP', ko: 'ko-KR', fr: 'fr-FR', de: 'de-DE', es: 'es-ES', en: 'en-US' };
+                const utterLang = BCP47[lang] || lang || 'en-US';
+
+                try { window.speechSynthesis.cancel(); } catch (e) {}
+
+                const u = new SpeechSynthesisUtterance(text);
+                u.lang = utterLang;
+                u.volume = this.volume;
+
+                // Pick a matching installed voice if one is available.
+                const prefix = utterLang.slice(0, 2).toLowerCase();
+                const voices = window.speechSynthesis.getVoices() || [];
+                const match = voices.find(v => (v.lang || '').toLowerCase().startsWith(prefix));
+                if (match) u.voice = match;
+
+                this.currentUtterance = u;
+                this.botSpeaking = true;
+                this.bargeInChunks = 0;
+                this.updateListeningStatus('🔊 Speaking (talk to interrupt)...', 'processing');
+
+                u.onend = () => {
+                    if (this.currentUtterance !== u) return; // replaced by a barge-in
+                    this.currentUtterance = null;
+                    handBack();
+                };
+                u.onerror = () => {
+                    if (this.currentUtterance !== u) return;
+                    this.currentUtterance = null;
+                    handBack();
+                };
+
+                window.speechSynthesis.speak(u);
             }
 
             async performTurnDetection() {
@@ -1199,13 +1158,16 @@ const HTML_CONTENT = `
                 
                 this.isListening = false;
                 this.isProcessingTurn = false;
+                this.botSpeaking = false;
+                this.bargeInChunks = 0;
                 this.pendingTurnDetection = false;
                 this.audioBuffer = [];
                 this.lastTurnDetectionTime = 0;
+                this.vadState = 'idle';
+                this.silenceMs = 0;
+                this.stopPlayback();
                 this.updateListeningStatus('Ready to listen', '');
-                this.toggleBtn.textContent = '🎤 Start Listening';
-                this.toggleBtn.classList.remove('recording');
-                
+
                 if (this.silenceTimeout) {
                     clearTimeout(this.silenceTimeout);
                 }
@@ -1375,13 +1337,14 @@ const HTML_CONTENT = `
                 }
             }
 
-            sendAudioForProcessing(audioBase64) {
+            sendAudioForProcessing(audioBase64, sampleRate) {
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.addMessage('user', '🎤 [Processing speech...]');
-                    
+                    // Don't add a placeholder — the server will send back a
+                    // transcript message and the client will render that.
                     const message = JSON.stringify({
                         type: 'audio_processing',
-                        audio: audioBase64
+                        audio: audioBase64,
+                        sample_rate: sampleRate || 16000
                     });
                     this.ws.send(message);
                 }
@@ -1411,7 +1374,6 @@ const HTML_CONTENT = `
                     return;
                 } else if (data instanceof Blob) {
                     console.log('Received binary audio data (Blob), size:', data.size);
-                    // Convert Blob to ArrayBuffer and play
                     data.arrayBuffer().then(arrayBuffer => {
                         this.playBinaryAudio(arrayBuffer);
                     }).catch(error => {
@@ -1431,6 +1393,19 @@ const HTML_CONTENT = `
                             console.log('Received base64 audio');
                             this.playAudio(message.audio);
                             break;
+                        case 'transcript':
+                            // What Whisper heard
+                            this.addMessage('user', '🗣️ ' + message.text + (message.lang ? ' [' + message.lang + ']' : ''));
+                            break;
+                        case 'response_text':
+                            // What the LLM replied (audio for this text follows as binary)
+                            this.addMessage('bot', '🤖 ' + message.text);
+                            break;
+                        case 'speak_text':
+                            // No server-side voice for this language — speak it
+                            // locally with the browser's built-in synthesizer.
+                            this.speakWithBrowser(message.text, message.lang);
+                            break;
                         case 'text':
                             this.addMessage('bot', message.text);
                             if (message.message) {
@@ -1442,6 +1417,16 @@ const HTML_CONTENT = `
                             break;
                         case 'error':
                             this.addMessage('error', message.message);
+                            // Server gave up on this turn — hand the mic back
+                            this.stopPlayback();
+                            this.botSpeaking = false;
+                            this.isProcessingTurn = false;
+                            this.vadState = 'idle';
+                            this.silenceMs = 0;
+                            this.audioBuffer = [];
+                            if (this.isListening) {
+                                this.updateListeningStatus('🎧 Listening...', 'listening');
+                            }
                             break;
                         default:
                             console.log('Unknown message type:', message.type);
@@ -1479,17 +1464,44 @@ const HTML_CONTENT = `
                     source.buffer = decodedBuffer;
                     source.connect(gainNode);
                     gainNode.connect(this.audioContext.destination);
-                    
+
+                    this.currentSource = source;
+                    this.botSpeaking = true;
+                    this.bargeInChunks = 0;
+                    this.updateListeningStatus('🔊 Speaking (talk to interrupt)...', 'processing');
+
                     source.onended = () => {
                         console.log('Audio playback finished');
+                        // Ignore if a barge-in already replaced this source.
+                        if (this.currentSource !== source) return;
+                        this.currentSource = null;
+                        this.botSpeaking = false;
+                        // Hand the conversation back to the user
+                        this.isProcessingTurn = false;
+                        this.vadState = 'idle';
+                        this.silenceMs = 0;
+                        this.audioBuffer = [];
+                        if (this.isListening) {
+                            this.updateListeningStatus('🎧 Listening...', 'listening');
+                        }
                     };
-                    
+
                     source.start();
                     console.log('Audio playback started');
                     
                 } catch (error) {
                     console.error('Binary audio playback error:', error);
                     this.addMessage('error', 'Could not play audio response: ' + error.message);
+                    // Recover even if playback failed, otherwise we get stuck mute
+                    this.currentSource = null;
+                    this.botSpeaking = false;
+                    this.isProcessingTurn = false;
+                    this.vadState = 'idle';
+                    this.silenceMs = 0;
+                    this.audioBuffer = [];
+                    if (this.isListening) {
+                        this.updateListeningStatus('🎧 Listening...', 'listening');
+                    }
                 }
             }
 
@@ -1563,3 +1575,4 @@ const HTML_CONTENT = `
 </body>
 </html>
 `;
+
