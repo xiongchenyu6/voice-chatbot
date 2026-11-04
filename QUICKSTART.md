@@ -4,9 +4,9 @@
 
 A **realtime voice chatbot** running on **Cloudflare AI Workers** with these AI models:
 
-- **🎤 ASR**: `@cf/openai/whisper-tiny-en` (Speech-to-Text)
-- **🧠 LLM**: `@cf/openai/gpt-oss-120b` (Chat Responses) 
-- **🔊 TTS**: `@cf/deepgram/aura-1` (Text-to-Speech)
+- **🎤 ASR**: `@cf/openai/whisper-large-v3-turbo` (Speech-to-Text)
+- **🧠 LLM**: `@cf/zai-org/glm-4.7-flash` (Chat Responses) 
+- **🔊 TTS**: Aura 2 plus MeloTTS (language-aware speech output)
 
 ## 🚀 Quick Start
 
@@ -50,7 +50,7 @@ npm run deploy
 ```
 Browser Audio → WebSocket → Cloudflare Worker → Durable Object
                                     ↓
-Audio → Whisper → Text → GPT → Response → Aura → Audio
+Audio → Whisper → Text → GLM → Response → Language-aware TTS → Audio
                                     ↓
 Browser Audio ← WebSocket ← Cloudflare Worker ← Durable Object
 ```
@@ -81,20 +81,20 @@ voice-chatbot/
 
 ## 🎯 AI Model Details
 
-### Whisper Tiny EN (`@cf/openai/whisper-tiny-en`)
+### Whisper Large V3 Turbo (`@cf/openai/whisper-large-v3-turbo`)
 - Converts recorded audio to text
-- Optimized for English
-- Fast processing for real-time use
+- Handles multilingual speech more reliably
+- Better fit for mixed-language voice chat
 
-### GPT OSS 120B (`@cf/openai/gpt-oss-120b`)
+### GLM 4.7 Flash (`@cf/zai-org/glm-4.7-flash`)
 - Generates conversational responses
-- Large context window
-- Instruction-tuned for helpfulness
+- Optimized for multilingual dialogue
+- Faster response profile for voice interactions
 
-### Deepgram Aura (`@cf/deepgram/aura-1`)
-- High-quality text-to-speech
-- Natural voice synthesis
-- Low latency output
+### Aura 2 + MeloTTS
+- Uses Aura 2 for high-quality English and Spanish speech
+- Uses MeloTTS for supported multilingual fallback voices
+- Keeps spoken output closer to the user's language
 
 ## 🛠️ Customization
 
@@ -103,13 +103,13 @@ Edit `src/index.js` and replace model identifiers:
 
 ```javascript
 // ASR
-await this.env.AI.run('@cf/openai/whisper-tiny-en', {...});
+await this.env.AI.run('@cf/openai/whisper-large-v3-turbo', {...});
 
 // LLM
-await this.env.AI.run('@cf/openai/gpt-oss-120b', {...});
+await this.env.AI.run('@cf/zai-org/glm-4.7-flash', {...});
 
 // TTS
-await this.env.AI.run('@cf/deepgram/aura-1', {...});
+await this.env.AI.run('@cf/deepgram/aura-2-en', {...});
 ```
 
 ### Modify System Prompt

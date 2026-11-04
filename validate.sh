@@ -44,7 +44,13 @@ else
 fi
 
 # Check for AI model usage
-AI_MODELS=("@cf/openai/whisper-tiny-en" "@cf/openai/gpt-oss-120b" "@cf/deepgram/aura-1" "@cf/pipecat-ai/smart-turn-v2")
+AI_MODELS=(
+    "@cf/openai/whisper-large-v3-turbo"
+    "@cf/zai-org/glm-4.7-flash"
+    "@cf/deepgram/aura-2-en"
+    "@cf/myshell-ai/melotts"
+    "@cf/pipecat-ai/smart-turn-v2"
+)
 
 for model in "${AI_MODELS[@]}"; do
     if grep -q "$model" src/index.js; then

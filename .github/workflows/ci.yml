@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate project setup
+        run: ./validate.sh
+
+      - name: Bundle worker (dry run)
+        run: npx wrangler deploy --dry-run --outdir dist
+
+  dependabot-merge:
+    # Merge Dependabot PRs once the checks above pass. GITHUB_TOKEN is enough
+    # for dependency bumps; PRs that edit .github/workflows (Actions bumps) need
+    # DEPENDABOT_MERGE_TOKEN, a PAT with the Workflows permission stored as a
+    # Dependabot secret (Dependabot runs cannot read ordinary Actions secrets).
+    needs: [check]
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge the Dependabot PR
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDABOT_MERGE_TOKEN || github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge "$PR_URL" --squash
